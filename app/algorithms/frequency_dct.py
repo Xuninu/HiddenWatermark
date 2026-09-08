@@ -57,6 +57,16 @@ MAGIC_HAMMING = 5         # magic 允许的位错上限（32 位签名下：真�
 # 提取时的候选尺度（长边）：步长 64px，覆盖「原图等比缩放」与「中心裁剪后内容放大」的常见比例
 CANDIDATES = [1024, 960, 896, 832, 768, 704, 640, 576, 512, 448, 384, 320, 256, 192, 128]
 
+# ==================== 同步标记（Synchronization Pattern）====================
+# 同步标记用于裁切/截图后的自对齐：在水印区域4个角嵌入已知的强标记，
+# 检测时先扫描找到标记位置，再根据标记位置反推块网格的尺度和相位偏移。
+SYNC_U1, SYNC_V1 = 5, 5    # 同步标记用的 DCT 系数对（与数据用的 (2,2)/(1,3) 不同）
+SYNC_U2, SYNC_V2 = 4, 6
+SYNC_DELTA = 50.0           # 同步标记嵌入强度（比数据大很多，确保裁切后仍可检测）
+SYNC_BITS = 32              # 同步标记的比特数（32bit 使误匹配概率 <0.01%）
+SYNC_MATCH_TH = 26          # 同步标记匹配阈值（32bit 中至少匹配26bit才算找到标记）
+SYNC_CORNER_OFF = 2         # 同步标记距块网格角的偏移（块数），避免太靠边被裁掉
+
 # 8x8 DCT-II 正交基（预计算，批量向量化用）
 _DCT_MAT = np.zeros((8, 8), dtype=np.float64)
 for _i in range(8):
@@ -221,6 +231,110 @@ def _magic_from_key(key: str) -> np.ndarray:
     return np.array([(d[i // 8] >> (i % 8)) & 1 for i in range(MAGIC_BITS)], dtype=np.uint8)
 
 
+def _sync_pattern_from_key(key: str) -> np.ndarray:
+    """密钥 -> 32 bit 同步标记模式（确定性，错密钥无法匹配）。
+    使用与 magic 不同的派生前缀，确保同步标记和 magic 是独立的伪随机序列。"""
+    d = hashlib.sha256(f"hwm-sync::{key}".encode("utf-8")).digest()
+    return np.array([(d[i // 8] >> (i % 8)) & 1 for i in range(SYNC_BITS)], dtype=np.uint8)
+
+
+def _sync_corner_blocks(nb_h, nb_w):
+    """返回4个角的同步标记块坐标 (row, col)：左上、右上、左下、右下。
+    距角偏移 SYNC_CORNER_OFF 块，避免太靠边被裁掉。"""
+    r0, r1 = SYNC_CORNER_OFF, nb_h - 1 - SYNC_CORNER_OFF
+    c0, c1 = SYNC_CORNER_OFF, nb_w - 1 - SYNC_CORNER_OFF
+    return [(r0, c0), (r0, c1), (r1, c0), (r1, c1)]
+
+
+def _scan_sync_markers(Y, key):
+    """扫描同步标记：在 Y 通道中找 SYNC 系数对差分最大的4个 2x2 区域，
+    根据它们的位置反推块网格的左上角和块数。
+
+    返回 (off_h, off_w, nb_h, nb_w) 或 None（未找到有效标记）。
+
+    算法：
+    1. 对图像做 8x8 分块 DCT（从像素 (0,0) 开始，不假设块网格对齐）
+    2. 计算每个块的 SYNC 系数对差分 (c1-c2)
+    3. 对每个 2x2 块区域计算平均差分（同步标记区域差分应该很大）
+    4. 取差分最大的 N 个候选区域
+    5. 从候选中找4个构成矩形的区域（左上、右上、左下、右下）
+    6. 根据4个标记的位置计算块网格的左上角和块数
+    """
+    h, w = Y.shape
+    # 从 (0,0) 开始分块，不假设对齐
+    nb_h_full = h // BLOCK
+    nb_w_full = w // BLOCK
+    if nb_h_full < 8 or nb_w_full < 8:
+        return None
+
+    # 提取所有块并做 DCT
+    Yg = Y[:nb_h_full * BLOCK, :nb_w_full * BLOCK]
+    blocks = (Yg.reshape(nb_h_full, 8, nb_w_full, 8)
+              .transpose(0, 2, 1, 3).reshape(-1, 8, 8).astype(np.float64))
+    d_all = _blocks_dct2(blocks)
+    # SYNC 系数对差分
+    sync_diff = d_all[:, SYNC_U1, SYNC_V1] - d_all[:, SYNC_U2, SYNC_V2]
+    sync_diff = sync_diff.reshape(nb_h_full, nb_w_full)
+
+    # 对每个 2x2 区域计算平均差分
+    region_diff = np.zeros((nb_h_full - 1, nb_w_full - 1), dtype=np.float64)
+    region_diff = (sync_diff[:-1, :-1] + sync_diff[:-1, 1:] +
+                    sync_diff[1:, :-1] + sync_diff[1:, 1:]) / 4.0
+
+    # 取差分最大的 20 个候选区域
+    flat_idx = np.argsort(region_diff.ravel())[::-1][:20]
+    candidates = []
+    for idx in flat_idx:
+        r, c = np.unravel_index(idx, region_diff.shape)
+        candidates.append((r, c, float(region_diff[r, c])))
+
+    # 从候选中找4个构成矩形的区域
+    # 矩形条件：存在两个不同的行 r1<r2 和两个不同的列 c1<c2，
+    # 使得 (r1,c1), (r1,c2), (r2,c1), (r2,c2) 都在候选中
+    best_rect = None
+    best_score = 0
+    for i in range(len(candidates)):
+        for j in range(i + 1, len(candidates)):
+            r1, c1, s1 = candidates[i]
+            r2, c2, s2 = candidates[j]
+            if r1 == r2 or c1 == c2:
+                continue
+            # 检查另外两个角是否在候选中
+            corner_set = {(c[0], c[1]): c[2] for c in candidates}
+            if (r1, c2) in corner_set and (r2, c1) in corner_set:
+                # 找到一个矩形，计算总分
+                total = s1 + s2 + corner_set[(r1, c2)] + corner_set[(r2, c1)]
+                if total > best_score:
+                    best_score = total
+                    best_rect = (min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2))
+
+    if best_rect is None or best_score < SYNC_DELTA * 2.0:
+        return None
+
+    # 根据4个标记的位置计算块网格
+    # 标记在块网格中的位置：左上(SYNC_CORNER_OFF, SYNC_CORNER_OFF)，
+    # 右下(nb_h-1-SYNC_CORNER_OFF-1, nb_w-1-SYNC_CORNER_OFF-1)（因为是2x2区域的左上角）
+    mr0, mc0, mr1, mc1 = best_rect
+    # 标记区域左上角对应块网格中的 (SYNC_CORNER_OFF, SYNC_CORNER_OFF)
+    # 标记区域右下角对应块网格中的 (nb_h-1-SYNC_CORNER_OFF-1, nb_w-1-SYNC_CORNER_OFF-1)
+    # 所以块网格左上角像素偏移 = (mr0 - SYNC_CORNER_OFF) * BLOCK, (mc0 - SYNC_CORNER_OFF) * BLOCK
+    off_h = (mr0 - SYNC_CORNER_OFF) * BLOCK
+    off_w = (mc0 - SYNC_CORNER_OFF) * BLOCK
+    # 块网格大小 = (mr1 - mr0 + 1) + 2 * SYNC_CORNER_OFF + 1（因为2x2区域占2块）
+    nb_h = (mr1 - mr0) + 2 * SYNC_CORNER_OFF + 2
+    nb_w = (mc1 - mc0) + 2 * SYNC_CORNER_OFF + 2
+
+    # 验证块网格是否在图像范围内
+    if off_h < 0 or off_w < 0:
+        return None
+    if off_h + nb_h * BLOCK > h or off_w + nb_w * BLOCK > w:
+        return None
+    if nb_h < 8 or nb_w < 8:
+        return None
+
+    return off_h, off_w, nb_h, nb_w
+
+
 def _pick_font(size: int):
     """选择支持中文的字体（Windows 系统字体），失败则退回默认字体。"""
     for fp in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyhbd.ttc",
@@ -352,6 +466,27 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
         c1[need0] = mid[need0] - delta / 2.0
         d_all[:, U1, V1] = c1
         d_all[:, U2, V2] = c2
+
+        # ---- 同步标记嵌入：在4个角各嵌入一个 2x2 的强标记区域 ----
+        # 使用与数据不同的 SYNC 系数对，强嵌入 bit=1（c1-c2 >= SYNC_DELTA）。
+        # 4个角的标记用于裁切后的自定位：检测时找 SYNC 差分最大的4个 2x2 区域，
+        # 根据它们的位置反推块网格的尺度和偏移。
+        sync_pattern = _sync_pattern_from_key(key)  # 32bit 伪随机模式（预留，当前用全1强标记）
+        corners = _sync_corner_blocks(nb_h, nb_w)
+        for (cr, cc) in corners:
+            for dr in range(2):
+                for dc in range(2):
+                    br, bc = cr + dr, cc + dc
+                    if 0 <= br < nb_h and 0 <= bc < nb_w:
+                        idx = br * nb_w + bc
+                        sc1 = d_all[idx, SYNC_U1, SYNC_V1]
+                        sc2 = d_all[idx, SYNC_U2, SYNC_V2]
+                        smid = (sc1 + sc2) / 2.0
+                        # 强嵌入 bit=1：让 sc1 - sc2 >= SYNC_DELTA
+                        if sc1 - sc2 < SYNC_DELTA:
+                            d_all[idx, SYNC_U1, SYNC_V1] = smid + SYNC_DELTA / 2.0
+                            d_all[idx, SYNC_U2, SYNC_V2] = smid - SYNC_DELTA / 2.0
+
         blocks = _blocks_idct2(d_all)
         Y[off_h: off_h + nb_h * BLOCK, off_w: off_w + nb_w * BLOCK] = (
             blocks.reshape(nb_h, nb_w, 8, 8)
@@ -415,6 +550,26 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
                         r = self._decode(G, key, cand, REF_LONG, want_any=False, center=None)
                         if r is not None and self._is_hit(r):
                             return self._result(r, key)
+
+        # ---- 同步标记定位路径：裁切/截图后用4个角的同步标记自对齐 ----
+        # 在几个主要候选尺度下扫描同步标记，如果找到4个构成矩形的标记，
+        # 就根据标记位置反推块网格的偏移和大小，直接对齐提取。
+        # 这能解决中心裁切75%和非对称裁切后的尺度/相位对齐问题。
+        sync_candidates = [REF_LONG, 768, 512, 1280, 640, 896, 960]
+        for sync_size in sync_candidates:
+            G_sync = _resize_even_blocks(img, sync_size)
+            if G_sync.shape[0] < 64 or G_sync.shape[1] < 64:
+                continue
+            ycbcr_sync = cv2.cvtColor(G_sync, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+            Y_sync = ycbcr_sync[:, :, 0]
+            grid = _scan_sync_markers(Y_sync, key)
+            if grid is not None:
+                off_h, off_w, nb_h, nb_w = grid
+                if nb_h * nb_w >= TOTAL_BITS:
+                    r = self._decode(G_sync, key, cand, sync_size, want_any=False,
+                                      grid_info=(nb_h, nb_w, off_h, off_w))
+                    if r is not None and self._is_hit(r):
+                        return self._result(r, key)
 
         # ---- 锚点粗扫 + 局部精扫：覆盖裁剪/缩放/改分辨率（内容占满画布） ----
         # 常用候选锚点先秒级探测，命中直接返回；未命中则对所有「接近通过」的锚点
@@ -520,12 +675,15 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
                 "cand_size": r["cand_size"],
                 "matched_content": matched, "similarity": r["sim"]}
 
-    def _decode(self, G, key, cand_contents, cand_size, want_any=True, center=None):
+    def _decode(self, G, key, cand_contents, cand_size, want_any=True, center=None, grid_info=None):
         """在参考坐标系图 G 上按密钥向量化投票解码（块网格中心锚定）。
 
         嵌入与检测都以「图中心」为块网格原点，中心裁剪不移动内容中心，
         因此裁剪后无需相位平移即可对齐。center=(cx, cy) 可指定块网格中心
         （截图含边框/标题栏导致内容偏移时，用内容中心锚定）。
+
+        grid_info=(nb_h, nb_w, off_h, off_w) 可直接指定块网格（同步标记定位后使用），
+        指定时忽略 center 参数，直接用给定的块网格位置和大小提取。
 
         want_any=True（旧接口）：magic 通过则直接返回完整结果，否则 None；
         want_any=False（搜索用）：总是返回诊断信息（含 magic_err / passed / sim），供上层排名。
@@ -533,7 +691,12 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
         ycbcr = cv2.cvtColor(G, cv2.COLOR_BGR2YCrCb).astype(np.float32)
         Y = ycbcr[:, :, 0]
         h, w = Y.shape
-        if center:
+        if grid_info is not None:
+            nb_h, nb_w, off_h, off_w = grid_info
+            # 验证块网格在图像范围内
+            if off_h < 0 or off_w < 0 or off_h + nb_h * BLOCK > h or off_w + nb_w * BLOCK > w:
+                return None
+        elif center:
             nb_h, nb_w, off_h, off_w = _grid_info(h, w, int(center[0]), int(center[1]))
         else:
             nb_h, nb_w, off_h, off_w = _grid_info(h, w)
