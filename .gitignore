@@ -58,6 +58,7 @@ test_geo/
 /*.tga
 /*.txt
 !requirements.txt
+!version.txt
 /*.ps
 /output_batch/
 /samples/
