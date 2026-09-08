@@ -47,10 +47,11 @@ REF_LONG = 1024           # 参考坐标系长边：嵌入与提取共用，保�
 CAND_MAX = REF_LONG * 3 // 2   # 检测候选长边上限（截图带留白/边框 -> 内容缩小 -> 需放大 >REF）
 WM_W, WM_H = 40, 10       # 固定水印内容画布（宽, 高）
 CONTENT_BITS = WM_W * WM_H
+CONTENT_REPEAT = 3         # 内容比特重复嵌入次数（抗裁切/抗噪：3副本多数投票可纠正1/3错误）
 MAGIC_BITS = 32           # 密钥绑定的 magic 校验位（独立于内容，抗误报）：
                           # 32 位签名使「无水印/错密钥在全尺度扫描中偶合命中」概率 <0.02%
 MAGIC_REPEAT = 7          # magic 每 bit 重复嵌入次数（提取时多数判决，抗位错/抗 JPEG）
-TOTAL_BITS = CONTENT_BITS + MAGIC_BITS * MAGIC_REPEAT
+TOTAL_BITS = CONTENT_BITS * CONTENT_REPEAT + MAGIC_BITS * MAGIC_REPEAT
 MAGIC_HAMMING = 5         # magic 允许的位错上限（32 位签名下：真实水印含缩放/JPEG 攻击
                           # 位错 0~5，无水印/错密钥位错 >=9，间隔清晰；偶合误报概率极低）
 # 提取时的候选尺度（长边）：步长 64px，覆盖「原图等比缩放」与「中心裁剪后内容放大」的常见比例
@@ -295,9 +296,15 @@ def _blocks_idct2(blocks):
 
 
 def _build_payload(content, key):
-    """构造完整载荷：内容 bits + magic bits（重复 MAGIC_REPEAT 次）。"""
+    """构造完整载荷：内容 bits（重复 CONTENT_REPEAT 次）+ magic bits（重复 MAGIC_REPEAT 次）。
+
+    内容重复 3 次的载荷结构：
+      [内容副本0: 400 bits][内容副本1: 400 bits][内容副本2: 400 bits][magic: 32×7=224 bits]
+    提取时对 3 个内容副本做投票数合并 + 多数判决，裁切/噪声导致某个副本受损时，
+    其他副本仍可提供正确比特，从而显著提升抗裁切能力。"""
     magic = _magic_from_key(key)
-    return np.concatenate([content.ravel().astype(np.uint8),
+    content_bits = content.ravel().astype(np.uint8)
+    return np.concatenate([np.tile(content_bits, CONTENT_REPEAT),
                            np.tile(magic, MAGIC_REPEAT)])
 
 
@@ -417,6 +424,7 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
         best_r = None            # 最接近命中的解码结果
         best_score = None        # (magic_err, -sim)
         promising = []           # magic 接近通过的锚点候选（需精扫）
+        all_results = []         # 保存所有候选的解码结果，供后续相位搜索
         for cand_size in anchors:
             G = _resize_even_blocks(img, cand_size)
             if G.shape[0] < 64 or G.shape[1] < 64:
@@ -424,18 +432,19 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
             r = self._decode(G, key, cand, cand_size, want_any=False, center=None)
             if r is None:
                 continue
+            all_results.append(r)
             if self._is_hit(r):
                 return self._result(r, key)      # 锚点直接命中
-            if r["magic_err"] <= MAGIC_HAMMING + 3:
+            if r["magic_err"] <= MAGIC_HAMMING + 15:
                 promising.append(cand_size)
             if best_score is None or (r["magic_err"], -r["sim"]) < best_score:
                 best_score = (r["magic_err"], -r["sim"])
                 best_r = r
 
-        # 对每个「接近」锚点在 ±64 范围按 8px 步长精扫（正确候选常不在锚点上，
-        # 如内容 60% 的正确候选 616 位于锚点 512/640 之间）
+        # 对每个「接近」锚点在 ±128 范围按 8px 步长精扫（正确候选常不在锚点上，
+        # 如内容 60% 的正确候选 616 位于锚点 512/640 之间；裁切后尺度偏移更大）
         for a0 in promising:
-            for cand_size in range(max(128, a0 - 64), min(CAND_MAX, a0 + 65), 8):
+            for cand_size in range(max(128, a0 - 128), min(CAND_MAX, a0 + 129), 8):
                 if cand_size == a0 or cand_size in anchors:
                     continue
                 G = _resize_even_blocks(img, cand_size)
@@ -444,6 +453,7 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
                 r = self._decode(G, key, cand, cand_size, want_any=False, center=None)
                 if r is None:
                     continue
+                all_results.append(r)
                 if self._is_hit(r):
                     return self._result(r, key)
                 if (r["magic_err"], -r["sim"]) < best_score:
@@ -452,17 +462,19 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
 
         # ---- 相位精扫：正确候选可能落在 8px 网格之间（如内容 76% -> 候选 778） ----
         # 此时块网格相对内容相位偏移数像素，DCT 差分符号被破坏（magic 飙高）。
-        # 对「接近通过」的最佳候选做两阶段相位平移（粗 4px + 精 1px）即可对齐。
-        if best_r is not None and best_r["magic_err"] <= MAGIC_HAMMING + 3:
+        # 对 magic_err 最低的最佳候选做大范围相位平移搜索。
+        # 裁切/截图后相位偏移常达 ±8~16px，因此搜索范围扩大到 ±16px。
+        if best_r is not None and best_r["magic_err"] <= MAGIC_HAMMING + 15:
             G = _resize_even_blocks(img, best_r["cand_size"])
             base = _grid_info(G.shape[0], G.shape[1])
             cx = base[3] + (base[1] // 2) * 8        # 块网格中心像素
             cy = base[2] + (base[0] // 2) * 8
-            for step in (4, 1):
-                for dy in range(-step, step + 1, step):
-                    for dx in range(-step, step + 1, step):
+            # 两阶段相位搜索：粗扫 ±12px（步长4），精扫 ±4px（步长1）
+            for step, max_off in ((4, 12), (1, 4)):
+                for dy in range(-max_off, max_off + 1, step):
+                    for dx in range(-max_off, max_off + 1, step):
                         if dx == 0 and dy == 0 and step == 4:
-                            continue                 # 中心相位已在锚点/精扫阶段试过
+                            continue
                         r = self._decode(G, key, cand, best_r["cand_size"],
                                          want_any=False, center=(cx + dx, cy + dy))
                         if r is None:
@@ -540,14 +552,21 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
         np.add.at(votes, kmat.ravel(), sign)
         bits = (votes > 0).astype(np.uint8)
 
+        # ---- 内容比特：3 副本投票数合并 + 多数判决 ----
+        # 载荷结构：[副本0:400][副本1:400][副本2:400][magic:224]
+        # 将 3 个副本的投票数按位相加，再做符号判决。裁切后某个副本的块数减少时，
+        # 其他副本仍可贡献投票，合并后总投票数 ≈ 单副本的 3 倍，显著提升信噪比。
+        content_total = CONTENT_BITS * CONTENT_REPEAT
+        content_votes = votes[:content_total].reshape(CONTENT_REPEAT, CONTENT_BITS).sum(axis=0)
+        content_bits = (content_votes > 0).astype(np.uint8)
+
         # magic 校验：magic 每 bit 的 MAGIC_REPEAT 次重复分散在 MAGIC_BITS 轮的固定位置
         magic_exp = _magic_from_key(key)
-        seg = bits[CONTENT_BITS:].reshape(MAGIC_REPEAT, MAGIC_BITS)
+        seg = bits[content_total:].reshape(MAGIC_REPEAT, MAGIC_BITS)
         magic_got = (seg.sum(axis=0) >= (MAGIC_REPEAT + 1) // 2).astype(np.uint8)
         magic_err = int(np.count_nonzero(magic_got != magic_exp))
         passed = magic_err <= MAGIC_HAMMING
 
-        content_bits = bits[:CONTENT_BITS]
         wm_arr = (content_bits.reshape((WM_H, WM_W)) * 255).astype(np.uint8)
         best, sim = _match_content(wm_arr, cand_contents)
 
