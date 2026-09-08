@@ -50,19 +50,20 @@ CONTENT_BITS = WM_W * WM_H
 CONTENT_REPEAT = 3         # 内容比特重复嵌入次数（抗裁切/抗噪：3副本多数投票可纠正1/3错误）
 MAGIC_BITS = 32           # 密钥绑定的 magic 校验位（独立于内容，抗误报）：
                           # 32 位签名使「无水印/错密钥在全尺度扫描中偶合命中」概率 <0.02%
-MAGIC_REPEAT = 7          # magic 每 bit 重复嵌入次数（提取时多数判决，抗位错/抗 JPEG）
+MAGIC_REPEAT = 15         # magic 每 bit 重复嵌入次数（提取时多数判决，抗裁切/抗位错/抗 JPEG）
 TOTAL_BITS = CONTENT_BITS * CONTENT_REPEAT + MAGIC_BITS * MAGIC_REPEAT
-MAGIC_HAMMING = 5         # magic 允许的位错上限（32 位签名下：真实水印含缩放/JPEG 攻击
-                          # 位错 0~5，无水印/错密钥位错 >=9，间隔清晰；偶合误报概率极低）
+MAGIC_HAMMING = 8         # magic 允许的位错上限（32 位签名下：真实水印含缩放/JPEG/裁切
+                          # 位错 0~8，无水印/错密钥位错 >=12，间隔清晰；偶合误报概率极低）
 # 提取时的候选尺度（长边）：步长 64px，覆盖「原图等比缩放」与「中心裁剪后内容放大」的常见比例
 CANDIDATES = [1024, 960, 896, 832, 768, 704, 640, 576, 512, 448, 384, 320, 256, 192, 128]
 
 # ==================== 同步标记（Synchronization Pattern）====================
-# 同步标记用于裁切/截图后的自对齐：在水印区域4个角嵌入已知的强标记，
+# 同步标记用于裁切/截图后的自对齐：在水印区域4个角+中心嵌入已知的强标记，
 # 检测时先扫描找到标记位置，再根据标记位置反推块网格的尺度和相位偏移。
-SYNC_U1, SYNC_V1 = 5, 5    # 同步标记用的 DCT 系数对（与数据用的 (2,2)/(1,3) 不同）
-SYNC_U2, SYNC_V2 = 4, 6
-SYNC_DELTA = 50.0           # 同步标记嵌入强度（比数据大很多，确保裁切后仍可检测）
+SYNC_U1, SYNC_V1 = U1, V1  # 同步标记用与数据相同的低频系数对(2,2)/(1,3)，耐两次resize
+SYNC_U2, SYNC_V2 = U2, V2
+SYNC_DELTA = 100.0          # 同步标记嵌入强度（远大于数据20，两次resize后仍≈98）
+SYNC_MARKER_SIZE = 4        # 同步标记区域大小（4x4块，降低噪声标准差≈10，信噪比≈40σ）
 SYNC_BITS = 32              # 同步标记的比特数（32bit 使误匹配概率 <0.01%）
 SYNC_MATCH_TH = 26          # 同步标记匹配阈值（32bit 中至少匹配26bit才算找到标记）
 SYNC_CORNER_OFF = 2         # 同步标记距块网格角的偏移（块数），避免太靠边被裁掉
@@ -240,98 +241,267 @@ def _sync_pattern_from_key(key: str) -> np.ndarray:
 
 def _sync_corner_blocks(nb_h, nb_w):
     """返回4个角的同步标记块坐标 (row, col)：左上、右上、左下、右下。
+    返回的是 SYNC_MARKER_SIZE x SYNC_MARKER_SIZE 区域的左上角坐标。
     距角偏移 SYNC_CORNER_OFF 块，避免太靠边被裁掉。"""
-    r0, r1 = SYNC_CORNER_OFF, nb_h - 1 - SYNC_CORNER_OFF
-    c0, c1 = SYNC_CORNER_OFF, nb_w - 1 - SYNC_CORNER_OFF
+    MS = SYNC_MARKER_SIZE
+    r0, r1 = SYNC_CORNER_OFF, nb_h - SYNC_CORNER_OFF - MS
+    c0, c1 = SYNC_CORNER_OFF, nb_w - SYNC_CORNER_OFF - MS
     return [(r0, c0), (r0, c1), (r1, c0), (r1, c1)]
 
 
 def _scan_sync_markers(Y, key):
-    """扫描同步标记：在 Y 通道中找 SYNC 系数对差分最大的4个 2x2 区域，
-    根据它们的位置反推块网格的左上角和块数。
+    """扫描同步标记：在 Y 通道中找 SYNC 系数对差分最大的标记区域，
+    根据标记位置反推块网格的左上角和块数。
+
+    支持4个/3个/2个标记定位：
+    - 4个标记构成矩形：最可靠，优先级最高
+    - 3个标记构成L形：裁掉1个角后可用
+    - 2个标记：尝试所有6种角组合，裁掉2个角后可用
+
+    相位搜索：块网格可能从像素(ph,pw)开始（0<=ph,pw<8），先在相位(0,0)下
+    找候选区域，再对每个候选区域尝试8x8种相位做局部DCT，找到差分最大的相位，
+    最后用最佳相位做全图DCT定位所有标记。
 
     返回 (off_h, off_w, nb_h, nb_w) 或 None（未找到有效标记）。
-
-    算法：
-    1. 对图像做 8x8 分块 DCT（从像素 (0,0) 开始，不假设块网格对齐）
-    2. 计算每个块的 SYNC 系数对差分 (c1-c2)
-    3. 对每个 2x2 块区域计算平均差分（同步标记区域差分应该很大）
-    4. 取差分最大的 N 个候选区域
-    5. 从候选中找4个构成矩形的区域（左上、右上、左下、右下）
-    6. 根据4个标记的位置计算块网格的左上角和块数
     """
     h, w = Y.shape
-    # 从 (0,0) 开始分块，不假设对齐
-    nb_h_full = h // BLOCK
-    nb_w_full = w // BLOCK
-    if nb_h_full < 8 or nb_w_full < 8:
+    if h < 64 or w < 64:
         return None
 
-    # 提取所有块并做 DCT
-    Yg = Y[:nb_h_full * BLOCK, :nb_w_full * BLOCK]
-    blocks = (Yg.reshape(nb_h_full, 8, nb_w_full, 8)
-              .transpose(0, 2, 1, 3).reshape(-1, 8, 8).astype(np.float64))
-    d_all = _blocks_dct2(blocks)
-    # SYNC 系数对差分
-    sync_diff = d_all[:, SYNC_U1, SYNC_V1] - d_all[:, SYNC_U2, SYNC_V2]
-    sync_diff = sync_diff.reshape(nb_h_full, nb_w_full)
+    def _region_diff_at_phase(ph, pw):
+        """在指定相位(ph,pw)下做全图DCT，返回4x4区域平均差分图和块网格大小。"""
+        nb_hf = (h - ph) // BLOCK
+        nb_wf = (w - pw) // BLOCK
+        MS = SYNC_MARKER_SIZE  # 4
+        if nb_hf < MS + 1 or nb_wf < MS + 1:
+            return None, 0, 0
+        Yg = Y[ph:ph + nb_hf * BLOCK, pw:pw + nb_wf * BLOCK]
+        blocks = (Yg.reshape(nb_hf, 8, nb_wf, 8)
+                  .transpose(0, 2, 1, 3).reshape(-1, 8, 8).astype(np.float64))
+        d = _blocks_dct2(blocks)
+        sd = (d[:, SYNC_U1, SYNC_V1] - d[:, SYNC_U2, SYNC_V2]).reshape(nb_hf, nb_wf)
+        # 用积分图快速计算4x4区域平均差分
+        integral = np.cumsum(np.cumsum(sd, axis=0), axis=1)
+        rd = np.zeros((nb_hf - MS + 1, nb_wf - MS + 1), dtype=np.float64)
+        for r in range(nb_hf - MS + 1):
+            for c in range(nb_wf - MS + 1):
+                r2, c2 = r + MS - 1, c + MS - 1
+                s = integral[r2, c2]
+                if r > 0: s -= integral[r - 1, c2]
+                if c > 0: s -= integral[r2, c - 1]
+                if r > 0 and c > 0: s += integral[r - 1, c - 1]
+                rd[r, c] = s / (MS * MS)
+        return rd, nb_hf, nb_wf
 
-    # 对每个 2x2 区域计算平均差分
-    region_diff = np.zeros((nb_h_full - 1, nb_w_full - 1), dtype=np.float64)
-    region_diff = (sync_diff[:-1, :-1] + sync_diff[:-1, 1:] +
-                    sync_diff[1:, :-1] + sync_diff[1:, 1:]) / 4.0
+    # 1. 8x8相位全图搜索：对每种相位做全图DCT，计算5个标记位置中最大2个的4x4平均差分和，
+    # 找到差分最大的相位。用最大2个而非全部5个，是因为裁切后可能只有部分标记保留。
+    # 64次全图DCT约需2-3秒，确保找到正确相位。
+    MS = SYNC_MARKER_SIZE
+    best_phase = (0, 0)
+    best_phase_score = -1e9
+    best_region_diff = None
+    best_nb_hf = best_nb_wf = 0
+    for ph in range(8):
+        for pw in range(8):
+            rd, nb_hf, nb_wf = _region_diff_at_phase(ph, pw)
+            if rd is None:
+                continue
+            # 计算5个标记位置的4x4平均差分，取最大2个的和
+            corners = _sync_corner_blocks(nb_hf, nb_wf)
+            center = (nb_hf // 2 - MS // 2, nb_wf // 2 - MS // 2)
+            diffs = []
+            for (cr, cc) in corners + [center]:
+                if 0 <= cr < rd.shape[0] and 0 <= cc < rd.shape[1]:
+                    diffs.append(rd[cr, cc])
+            diffs.sort(reverse=True)
+            score = sum(diffs[:2])  # 最大2个的和
+            if score > best_phase_score:
+                best_phase_score = score
+                best_phase = (ph, pw)
+                best_region_diff = rd
+                best_nb_hf, best_nb_wf = nb_hf, nb_wf
 
-    # 取差分最大的 20 个候选区域
-    flat_idx = np.argsort(region_diff.ravel())[::-1][:20]
+    if best_region_diff is None or best_phase_score < SYNC_DELTA * 0.8:
+        return None
+
+    # 2. 用最佳相位做全图DCT，找到所有同步标记的位置
+    ph, pw = best_phase
+    region_diff = best_region_diff
+    nb_h_full, nb_w_full = best_nb_hf, best_nb_wf
+
+    # 取差分最大的 15 个候选区域
+    flat_idx = np.argsort(region_diff.ravel())[::-1][:15]
     candidates = []
     for idx in flat_idx:
         r, c = np.unravel_index(idx, region_diff.shape)
         candidates.append((r, c, float(region_diff[r, c])))
 
-    # 从候选中找4个构成矩形的区域
-    # 矩形条件：存在两个不同的行 r1<r2 和两个不同的列 c1<c2，
-    # 使得 (r1,c1), (r1,c2), (r2,c1), (r2,c2) 都在候选中
-    best_rect = None
-    best_score = 0
+    if not candidates or candidates[0][2] < SYNC_DELTA * 0.3:
+        return None
+
+    corner_set = {(c[0], c[1]): c[2] for c in candidates}
+
+    # 标记在块网格中的位置（4x4区域左上角的块坐标）：
+    # TL=(2,2), TR=(2, nb_w-6), BL=(nb_h-6, 2), BR=(nb_h-6, nb_w-6)
+    # CENTER=(nb_h//2-2, nb_w//2-2) —— 中心标记，与任意角标记配合即可定位
+    # 标记间距：BR-TL = (nb_h-8, nb_w-8)
+    OFF = SYNC_CORNER_OFF  # =2
+    MARKER_W = SYNC_MARKER_SIZE  # 4x4区域
+
+    def _validate(off_h, off_w, nb_h, nb_w):
+        """验证块网格是否在图像范围内且大小合理。"""
+        if off_h < -4 or off_w < -4:
+            return False
+        if off_h + nb_h * BLOCK > h + 4 or off_w + nb_w * BLOCK > w + 4:
+            return False
+        if nb_h < 8 or nb_w < 8 or nb_h > 256 or nb_w > 256:
+            return False
+        return True
+
+    best_result = None
+    best_total = 0
+
+    # ========== 4个标记构成矩形（最可靠） ==========
     for i in range(len(candidates)):
         for j in range(i + 1, len(candidates)):
             r1, c1, s1 = candidates[i]
             r2, c2, s2 = candidates[j]
             if r1 == r2 or c1 == c2:
                 continue
-            # 检查另外两个角是否在候选中
-            corner_set = {(c[0], c[1]): c[2] for c in candidates}
             if (r1, c2) in corner_set and (r2, c1) in corner_set:
-                # 找到一个矩形，计算总分
                 total = s1 + s2 + corner_set[(r1, c2)] + corner_set[(r2, c1)]
-                if total > best_score:
-                    best_score = total
-                    best_rect = (min(r1, r2), min(c1, c2), max(r1, r2), max(c1, c2))
+                mr0, mc0 = min(r1, r2), min(c1, c2)
+                mr1, mc1 = max(r1, r2), max(c1, c2)
+                # TL=(2,2), BR=(nb_h-6, nb_w-6), 间距=(nb_h-8, nb_w-8)
+                nb_h = (mr1 - mr0) + 8
+                nb_w = (mc1 - mc0) + 8
+                off_h = (mr0 - OFF) * BLOCK
+                off_w = (mc0 - OFF) * BLOCK
+                if _validate(off_h, off_w, nb_h, nb_w) and total > best_total:
+                    best_total = total
+                    best_result = (off_h, off_w, nb_h, nb_w)
 
-    if best_rect is None or best_score < SYNC_DELTA * 2.0:
+    # ========== 3个标记构成L形 ==========
+    if best_result is None:
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                for k in range(j + 1, len(candidates)):
+                    r1, c1, s1 = candidates[i]
+                    r2, c2, s2 = candidates[j]
+                    r3, c3, s3 = candidates[k]
+                    rows = {r1, r2, r3}
+                    cols = {c1, c2, c3}
+                    # L形：恰好2个不同行和2个不同列
+                    if len(rows) == 2 and len(cols) == 2:
+                        total = s1 + s2 + s3
+                        mr0, mc0 = min(rows), min(cols)
+                        mr1, mc1 = max(rows), max(cols)
+                        nb_h = (mr1 - mr0) + 8
+                        nb_w = (mc1 - mc0) + 8
+                        off_h = (mr0 - OFF) * BLOCK
+                        off_w = (mc0 - OFF) * BLOCK
+                        if _validate(off_h, off_w, nb_h, nb_w) and total > best_total:
+                            best_total = total
+                            best_result = (off_h, off_w, nb_h, nb_w)
+
+    # ========== 2个标记（尝试角组合 + 中心+角组合） ==========
+    if best_result is None:
+        est_nb_h = min(nb_h_full, 128)
+        est_nb_w = min(nb_w_full, 128)
+        top_candidates = candidates[:10]
+
+        for i in range(len(top_candidates)):
+            for j in range(i + 1, len(top_candidates)):
+                r1, c1, s1 = top_candidates[i]
+                r2, c2, s2 = top_candidates[j]
+                dr = r2 - r1
+                dc = c2 - c1
+                total = s1 + s2
+                if total < SYNC_DELTA * 0.6:
+                    continue
+
+                combos = []
+                # 标记位置(4x4左上角)：TL=(2,2), TR=(2,nb_w-6), BL=(nb_h-6,2), BR=(nb_h-6,nb_w-6)
+                # 角间距：TL-TR=(0,nb_w-8), TL-BL=(nb_h-8,0), TL-BR=(nb_h-8,nb_w-8)
+                #         TR-BL=(nb_h-8,-(nb_w-8)), TR-BR=(nb_h-8,0), BL-BR=(0,nb_w-8)
+
+                # TL-TR: 同行
+                if dr == 0 and dc > 0:
+                    combos.append((est_nb_h, dc + 8, 2, 2))
+                # TL-BL: 同列
+                if dc == 0 and dr > 0:
+                    combos.append((dr + 8, est_nb_w, 2, 2))
+                # TL-BR
+                if dr > 0 and dc > 0:
+                    combos.append((dr + 8, dc + 8, 2, 2))
+                # TR-BL: 标记1=TR=(2,nb_w-6)
+                if dr > 0 and dc < 0:
+                    nb_w = -dc + 8
+                    combos.append((dr + 8, nb_w, 2, nb_w - 6))
+                # TR-BR: 标记1=TR=(2,nb_w-6), 同列
+                if dc == 0 and dr > 0:
+                    combos.append((dr + 8, est_nb_w, 2, est_nb_w - 6))
+                # BL-BR: 标记1=BL=(nb_h-6,2), 同行
+                if dr == 0 and dc > 0:
+                    combos.append((est_nb_h, dc + 8, est_nb_h - 6, 2))
+
+                # 中心+角组合（标记1=中心=(nb_h//2-2,nb_w//2-2)）
+                # 中心→TL: dr=-(nb_h//2-4), dc=-(nb_w//2-4)
+                if dr < -1 and dc < -1:
+                    nb_h = 2 * (-dr + 4)
+                    nb_w = 2 * (-dc + 4)
+                    combos.append((nb_h, nb_w, nb_h // 2 - 2, nb_w // 2 - 2))
+                # 中心→TR: dr=-(nb_h//2-4), dc=nb_w//2-4
+                if dr < -1 and dc > 1:
+                    nb_h = 2 * (-dr + 4)
+                    nb_w = 2 * (dc + 4)
+                    combos.append((nb_h, nb_w, nb_h // 2 - 2, nb_w // 2 - 2))
+                # 中心→BL: dr=nb_h//2-4, dc=-(nb_w//2-4)
+                if dr > 1 and dc < -1:
+                    nb_h = 2 * (dr + 4)
+                    nb_w = 2 * (-dc + 4)
+                    combos.append((nb_h, nb_w, nb_h // 2 - 2, nb_w // 2 - 2))
+                # 中心→BR: dr=nb_h//2-4, dc=nb_w//2-4
+                if dr > 1 and dc > 1:
+                    nb_h = 2 * (dr + 4)
+                    nb_w = 2 * (dc + 4)
+                    combos.append((nb_h, nb_w, nb_h // 2 - 2, nb_w // 2 - 2))
+
+                # 角+中心组合（标记1=角，标记2=中心）
+                # TL→中心: dr=nb_h//2-4, dc=nb_w//2-4
+                if dr > 1 and dc > 1:
+                    combos.append((2 * (dr + 4), 2 * (dc + 4), 2, 2))
+                # TR→中心: dr=nb_h//2-4, dc=-(nb_w//2-4)
+                if dr > 1 and dc < -1:
+                    nb_w = 2 * (-dc + 4)
+                    combos.append((2 * (dr + 4), nb_w, 2, nb_w - 6))
+                # BL→中心: dr=-(nb_h//2-4), dc=nb_w//2-4
+                if dr < -1 and dc > 1:
+                    nb_h = 2 * (-dr + 4)
+                    combos.append((nb_h, 2 * (dc + 4), nb_h - 6, 2))
+                # BR→中心: dr=-(nb_h//2-4), dc=-(nb_w//2-4)
+                if dr < -1 and dc < -1:
+                    nb_h = 2 * (-dr + 4)
+                    nb_w = 2 * (-dc + 4)
+                    combos.append((nb_h, nb_w, nb_h - 6, nb_w - 6))
+
+                for nb_h, nb_w, gr1, gc1 in combos:
+                    off_h = (r1 - gr1) * BLOCK
+                    off_w = (c1 - gc1) * BLOCK
+                    if _validate(off_h, off_w, nb_h, nb_w) and total > best_total:
+                        best_total = total
+                        best_result = (off_h, off_w, nb_h, nb_w)
+
+    if best_result is None or best_total < SYNC_DELTA * 0.5:
         return None
 
-    # 根据4个标记的位置计算块网格
-    # 标记在块网格中的位置：左上(SYNC_CORNER_OFF, SYNC_CORNER_OFF)，
-    # 右下(nb_h-1-SYNC_CORNER_OFF-1, nb_w-1-SYNC_CORNER_OFF-1)（因为是2x2区域的左上角）
-    mr0, mc0, mr1, mc1 = best_rect
-    # 标记区域左上角对应块网格中的 (SYNC_CORNER_OFF, SYNC_CORNER_OFF)
-    # 标记区域右下角对应块网格中的 (nb_h-1-SYNC_CORNER_OFF-1, nb_w-1-SYNC_CORNER_OFF-1)
-    # 所以块网格左上角像素偏移 = (mr0 - SYNC_CORNER_OFF) * BLOCK, (mc0 - SYNC_CORNER_OFF) * BLOCK
-    off_h = (mr0 - SYNC_CORNER_OFF) * BLOCK
-    off_w = (mc0 - SYNC_CORNER_OFF) * BLOCK
-    # 块网格大小 = (mr1 - mr0 + 1) + 2 * SYNC_CORNER_OFF + 1（因为2x2区域占2块）
-    nb_h = (mr1 - mr0) + 2 * SYNC_CORNER_OFF + 2
-    nb_w = (mc1 - mc0) + 2 * SYNC_CORNER_OFF + 2
-
-    # 验证块网格是否在图像范围内
-    if off_h < 0 or off_w < 0:
-        return None
-    if off_h + nb_h * BLOCK > h or off_w + nb_w * BLOCK > w:
-        return None
-    if nb_h < 8 or nb_w < 8:
-        return None
-
+    off_h, off_w, nb_h, nb_w = best_result
+    # 加上相位偏移（块网格实际从像素(ph,pw)开始）
+    off_h += ph
+    off_w += pw
+    # 钳制到图像范围内
+    off_h = max(0, min(off_h, h - nb_h * BLOCK))
+    off_w = max(0, min(off_w, w - nb_w * BLOCK))
     return off_h, off_w, nb_h, nb_w
 
 
@@ -467,22 +637,26 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
         d_all[:, U1, V1] = c1
         d_all[:, U2, V2] = c2
 
-        # ---- 同步标记嵌入：在4个角各嵌入一个 2x2 的强标记区域 ----
-        # 使用与数据不同的 SYNC 系数对，强嵌入 bit=1（c1-c2 >= SYNC_DELTA）。
-        # 4个角的标记用于裁切后的自定位：检测时找 SYNC 差分最大的4个 2x2 区域，
-        # 根据它们的位置反推块网格的尺度和偏移。
+        # ---- 同步标记嵌入：在4个角 + 中心各嵌入一个 4x4 的强标记区域 ----
+        # 使用与数据相同的低频系数对(2,2)/(1,3)，强嵌入 bit=1（c1-c2 >= SYNC_DELTA）。
+        # 4x4区域降低噪声标准差（≈10），强度100远大于数据20，两次resize后差分仍≈98。
+        # 4个角标记用于完整图的自定位；中心标记用于非对称裁切（角标记被裁掉后，
+        # 中心标记+任意一个剩余角标记仍可定位块网格）。
         sync_pattern = _sync_pattern_from_key(key)  # 32bit 伪随机模式（预留，当前用全1强标记）
         corners = _sync_corner_blocks(nb_h, nb_w)
-        for (cr, cc) in corners:
-            for dr in range(2):
-                for dc in range(2):
+        # 中心标记位置：4x4区域的左上角，使区域中心对齐块网格中心
+        center_pos = (nb_h // 2 - SYNC_MARKER_SIZE // 2, nb_w // 2 - SYNC_MARKER_SIZE // 2)
+        all_markers = corners + [center_pos]
+        for (cr, cc) in all_markers:
+            for dr in range(SYNC_MARKER_SIZE):
+                for dc in range(SYNC_MARKER_SIZE):
                     br, bc = cr + dr, cc + dc
                     if 0 <= br < nb_h and 0 <= bc < nb_w:
                         idx = br * nb_w + bc
                         sc1 = d_all[idx, SYNC_U1, SYNC_V1]
                         sc2 = d_all[idx, SYNC_U2, SYNC_V2]
                         smid = (sc1 + sc2) / 2.0
-                        # 强嵌入 bit=1：让 sc1 - sc2 >= SYNC_DELTA
+                        # 强嵌入 bit=1：让 sc1 - sc2 >= SYNC_DELTA（覆盖数据嵌入）
                         if sc1 - sc2 < SYNC_DELTA:
                             d_all[idx, SYNC_U1, SYNC_V1] = smid + SYNC_DELTA / 2.0
                             d_all[idx, SYNC_U2, SYNC_V2] = smid - SYNC_DELTA / 2.0
@@ -663,6 +837,40 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
 
         if self._is_hit(best_r):
             return self._result(best_r, key)
+
+        # ---- 兜底：全图块网格偏移搜索（非对称裁切/截图带边框时，中心锚定失效） ----
+        # 对几个主要候选尺度，尝试常见块网格大小和不同偏移，找 magic_err 最小的组合。
+        # 非对称裁切掉左/上边后，块网格左上角偏移到图像内部，中心锚定找不到，
+        # 但全图搜索能遍历到正确的偏移位置。
+        fallback_sizes = [REF_LONG, 768, 512, 896, 720]
+        fallback_grids = [(84, 128), (80, 120), (76, 112), (88, 132), (72, 104)]
+        for fsize in fallback_sizes:
+            Gf = _resize_even_blocks(img, fsize)
+            if Gf.shape[0] < 64 or Gf.shape[1] < 64:
+                continue
+            hf, wf = Gf.shape[:2]
+            fbest_magic = 999
+            fbest_r = None
+            for (nb_h, nb_w) in fallback_grids:
+                if nb_h * BLOCK > hf or nb_w * BLOCK > wf:
+                    continue
+                # 偏移步长16，覆盖全图
+                for off_h in range(0, hf - nb_h * BLOCK + 1, 16):
+                    for off_w in range(0, wf - nb_w * BLOCK + 1, 16):
+                        r = self._decode(Gf, key, cand, fsize, want_any=False,
+                                          grid_info=(nb_h, nb_w, off_h, off_w))
+                        if r is not None and r["magic_err"] < fbest_magic:
+                            fbest_magic = r["magic_err"]
+                            fbest_r = r
+                            if fbest_magic <= MAGIC_HAMMING:
+                                break
+                    if fbest_magic <= MAGIC_HAMMING:
+                        break
+                if fbest_magic <= MAGIC_HAMMING:
+                    break
+            if fbest_r is not None and self._is_hit(fbest_r):
+                return self._result(fbest_r, key)
+
         return None
 
     @staticmethod
