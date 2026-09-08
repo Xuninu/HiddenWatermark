@@ -50,10 +50,10 @@ CONTENT_BITS = WM_W * WM_H
 CONTENT_REPEAT = 3         # 内容比特重复嵌入次数（抗裁切/抗噪：3副本多数投票可纠正1/3错误）
 MAGIC_BITS = 32           # 密钥绑定的 magic 校验位（独立于内容，抗误报）：
                           # 32 位签名使「无水印/错密钥在全尺度扫描中偶合命中」概率 <0.02%
-MAGIC_REPEAT = 15         # magic 每 bit 重复嵌入次数（提取时多数判决，抗裁切/抗位错/抗 JPEG）
+MAGIC_REPEAT = 31         # magic 每 bit 重复嵌入次数（提取时多数判决，抗裁切/抗位错/抗 JPEG）
 TOTAL_BITS = CONTENT_BITS * CONTENT_REPEAT + MAGIC_BITS * MAGIC_REPEAT
-MAGIC_HAMMING = 8         # magic 允许的位错上限（32 位签名下：真实水印含缩放/JPEG/裁切
-                          # 位错 0~8，无水印/错密钥位错 >=12，间隔清晰；偶合误报概率极低）
+MAGIC_HAMMING = 10        # magic 允许的位错上限（32 位签名下：真实水印含缩放/JPEG/裁切
+                          # 位错 0~10，无水印/错密钥位错 >=14，间隔清晰；偶合误报概率极低）
 # 提取时的候选尺度（长边）：步长 64px，覆盖「原图等比缩放」与「中心裁剪后内容放大」的常见比例
 CANDIDATES = [1024, 960, 896, 832, 768, 704, 640, 576, 512, 448, 384, 320, 256, 192, 128]
 
@@ -293,8 +293,9 @@ def _scan_sync_markers(Y, key):
                 rd[r, c] = s / (MS * MS)
         return rd, nb_hf, nb_wf
 
-    # 1. 8x8相位全图搜索：对每种相位做全图DCT，计算5个标记位置中最大2个的4x4平均差分和，
-    # 找到差分最大的相位。用最大2个而非全部5个，是因为裁切后可能只有部分标记保留。
+    # 1. 8x8相位全图搜索：对每种相位做全图DCT，找全图中4x4区域平均差分的最大值，
+    # 找到差分最大的相位。不假设标记在块网格的4个角，直接找全图最大差分区域，
+    # 这样非对称裁切后即使只有1个标记保留也能找到正确相位。
     # 64次全图DCT约需2-3秒，确保找到正确相位。
     MS = SYNC_MARKER_SIZE
     best_phase = (0, 0)
@@ -306,22 +307,15 @@ def _scan_sync_markers(Y, key):
             rd, nb_hf, nb_wf = _region_diff_at_phase(ph, pw)
             if rd is None:
                 continue
-            # 计算5个标记位置的4x4平均差分，取最大2个的和
-            corners = _sync_corner_blocks(nb_hf, nb_wf)
-            center = (nb_hf // 2 - MS // 2, nb_wf // 2 - MS // 2)
-            diffs = []
-            for (cr, cc) in corners + [center]:
-                if 0 <= cr < rd.shape[0] and 0 <= cc < rd.shape[1]:
-                    diffs.append(rd[cr, cc])
-            diffs.sort(reverse=True)
-            score = sum(diffs[:2])  # 最大2个的和
+            # 直接用全图最大差分作为相位判据（不假设标记位置）
+            score = float(rd.max())
             if score > best_phase_score:
                 best_phase_score = score
                 best_phase = (ph, pw)
                 best_region_diff = rd
                 best_nb_hf, best_nb_wf = nb_hf, nb_wf
 
-    if best_region_diff is None or best_phase_score < SYNC_DELTA * 0.8:
+    if best_region_diff is None or best_phase_score < SYNC_DELTA * 0.4:
         return None
 
     # 2. 用最佳相位做全图DCT，找到所有同步标记的位置
@@ -349,19 +343,54 @@ def _scan_sync_markers(Y, key):
     MARKER_W = SYNC_MARKER_SIZE  # 4x4区域
 
     def _validate(off_h, off_w, nb_h, nb_w):
-        """验证块网格是否在图像范围内且大小合理。"""
-        if off_h < -4 or off_w < -4:
-            return False
-        if off_h + nb_h * BLOCK > h + 4 or off_w + nb_w * BLOCK > w + 4:
-            return False
+        """验证块网格是否大小合理，且至少有一部分在图像范围内。"""
         if nb_h < 8 or nb_w < 8 or nb_h > 256 or nb_w > 256:
+            return False
+        # 允许负偏移：块网格左上角可能在图像外（非对称裁切）
+        # 但至少要有一部分在图像内
+        if off_h >= h or off_w >= w:
+            return False
+        if off_h + nb_h * BLOCK <= 0 or off_w + nb_w * BLOCK <= 0:
             return False
         return True
 
     best_result = None
     best_total = 0
 
-    # ========== 4个标记构成矩形（最可靠） ==========
+    # ========== 单标记反推（优先级最高，非对称裁切后只有1个标记保留时使用） ==========
+    # 不假设标记在当前块网格的4个角，根据标记在原始块网格中的已知位置反推。
+    # 原始块网格大小由当前图像尺寸决定（假设裁切后宽高比不变）。
+    ref_nb_h = h // BLOCK
+    ref_nb_w = w // BLOCK
+    marker_positions = {
+        'TL': (2, 2),
+        'TR': (2, ref_nb_w - 6),
+        'BL': (ref_nb_h - 6, 2),
+        'BR': (ref_nb_h - 6, ref_nb_w - 6),
+        'CENTER': (ref_nb_h // 2 - 2, ref_nb_w // 2 - 2),
+    }
+    for (r, c, s) in candidates[:10]:
+        if s < SYNC_DELTA * 0.3:
+            continue
+        for mname, (mr, mc) in marker_positions.items():
+            grid_r = r - mr
+            grid_c = c - mc
+            off_h_est = grid_r * BLOCK
+            off_w_est = grid_c * BLOCK
+            if (ref_nb_h < 8 or ref_nb_w < 8 or
+                    off_h_est + ref_nb_h * BLOCK < 0 or
+                    off_w_est + ref_nb_w * BLOCK < 0 or
+                    off_h_est > h or off_w_est > w):
+                continue
+            vis_h = min(h, off_h_est + ref_nb_h * BLOCK) - max(0, off_h_est)
+            vis_w = min(w, off_w_est + ref_nb_w * BLOCK) - max(0, off_w_est)
+            if vis_h < BLOCK * 8 or vis_w < BLOCK * 8:
+                continue
+            if s > best_total:
+                best_total = s
+                best_result = (off_h_est, off_w_est, ref_nb_h, ref_nb_w)
+
+    # ========== 4个标记构成矩形（最可靠，单标记失败时使用） ==========
     for i in range(len(candidates)):
         for j in range(i + 1, len(candidates)):
             r1, c1, s1 = candidates[i]
@@ -369,7 +398,12 @@ def _scan_sync_markers(Y, key):
             if r1 == r2 or c1 == c2:
                 continue
             if (r1, c2) in corner_set and (r2, c1) in corner_set:
-                total = s1 + s2 + corner_set[(r1, c2)] + corner_set[(r2, c1)]
+                s3 = corner_set[(r1, c2)]
+                s4 = corner_set[(r2, c1)]
+                total = s1 + s2 + s3 + s4
+                # 要求4个标记差分都足够大，且总差分 > SYNC_DELTA*2，避免噪声误判
+                if min(s1, s2, s3, s4) < SYNC_DELTA * 0.3 or total < SYNC_DELTA * 2:
+                    continue
                 mr0, mc0 = min(r1, r2), min(c1, c2)
                 mr1, mc1 = max(r1, r2), max(c1, c2)
                 # TL=(2,2), BR=(nb_h-6, nb_w-6), 间距=(nb_h-8, nb_w-8)
@@ -492,16 +526,14 @@ def _scan_sync_markers(Y, key):
                         best_total = total
                         best_result = (off_h, off_w, nb_h, nb_w)
 
-    if best_result is None or best_total < SYNC_DELTA * 0.5:
+    if best_result is None or best_total < SYNC_DELTA * 0.3:
         return None
 
     off_h, off_w, nb_h, nb_w = best_result
     # 加上相位偏移（块网格实际从像素(ph,pw)开始）
     off_h += ph
     off_w += pw
-    # 钳制到图像范围内
-    off_h = max(0, min(off_h, h - nb_h * BLOCK))
-    off_w = max(0, min(off_w, w - nb_w * BLOCK))
+    # 不钳制到图像范围内——非对称裁切后块网格左上角可能在图像外
     return off_h, off_w, nb_h, nb_w
 
 
@@ -556,13 +588,24 @@ def render_text_wm_fixed(text, w=WM_W, h=WM_H):
     return (np.array(img) < 128).astype(np.uint8)
 
 
-def _bit_map(nb_w, nb_h, seed):
+def _bit_map(nb_w, nb_h, seed, ref_nb_h=None, ref_nb_w=None, off_r=0, off_c=0):
     """所有块 -> 载荷位的映射矩阵 (nb_h, nb_w)：
-    基于「块相对图中心的坐标 + 密钥种子」的乘法散列。
-    中心裁剪后，相对坐标保持不变 -> 同一物理块映射到同一载荷位。
+    基于「块相对参考坐标系中心的坐标 + 密钥种子」的乘法散列。
+
+    默认 ref_nb_h/ref_nb_w=None 时用当前块网格大小作参考（中心锚定模式，
+    中心裁切后相对坐标不变 -> 同一物理块映射到同一载荷位）。
+
+    指定 ref_nb_h/ref_nb_w 和 off_r/off_c 时，用固定参考坐标系（非对称裁切模式）：
+    当前块(i,j)对应参考坐标系块(i+off_r, j+off_c)，再相对参考中心计算映射。
+    这样非对称裁切后只要找到正确的块偏移，映射关系就和嵌入时完全一致。
+
     返回 numpy int64 矩阵，与总块数无关，向量化快速计算。"""
-    rx = np.arange(nb_w, dtype=np.int64) - nb_w // 2
-    ry = np.arange(nb_h, dtype=np.int64) - nb_h // 2
+    if ref_nb_h is None:
+        ref_nb_h = nb_h
+    if ref_nb_w is None:
+        ref_nb_w = nb_w
+    rx = np.arange(nb_w, dtype=np.int64) + off_c - ref_nb_w // 2
+    ry = np.arange(nb_h, dtype=np.int64) + off_r - ref_nb_h // 2
     s = (seed & 0xFFFFFFFF)
     # Knuth 乘法散列：混合行/列/种子，保证分布均匀
     k = ((rx[None, :] * 2654435761) ^ (ry[:, None] * 40503) ^ s) % TOTAL_BITS
@@ -839,33 +882,34 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
             return self._result(best_r, key)
 
         # ---- 兜底：全图块网格偏移搜索（非对称裁切/截图带边框时，中心锚定失效） ----
-        # 对几个主要候选尺度，尝试常见块网格大小和不同偏移，找 magic_err 最小的组合。
-        # 非对称裁切掉左/上边后，块网格左上角偏移到图像内部，中心锚定找不到，
-        # 但全图搜索能遍历到正确的偏移位置。
-        fallback_sizes = [REF_LONG, 768, 512, 896, 720]
-        fallback_grids = [(84, 128), (80, 120), (76, 112), (88, 132), (72, 104)]
+        # 对几个主要候选尺度，使用当前图像块网格大小作参考坐标系，尝试不同偏移（含负偏移），
+        # 找 magic_err 最小的组合。非对称裁切掉左/上边后，块网格左上角偏移到图像外（负偏移），
+        # 中心锚定找不到，但全图搜索能遍历到正确的偏移位置。
+        # _decode 已支持负偏移和参考坐标系映射，因此裁切后映射关系与嵌入时完全一致。
+        fallback_sizes = [REF_LONG, 896, 768, 720, 512]
         for fsize in fallback_sizes:
             Gf = _resize_even_blocks(img, fsize)
             if Gf.shape[0] < 64 or Gf.shape[1] < 64:
                 continue
             hf, wf = Gf.shape[:2]
+            # 参考坐标系大小 = 中心锚定的块网格大小（与嵌入时一致）
+            ref_nb_h, ref_nb_w, _, _ = _grid_info(hf, wf)
+            if ref_nb_h * ref_nb_w < TOTAL_BITS:
+                continue
             fbest_magic = 999
             fbest_r = None
-            for (nb_h, nb_w) in fallback_grids:
-                if nb_h * BLOCK > hf or nb_w * BLOCK > wf:
-                    continue
-                # 偏移步长16，覆盖全图
-                for off_h in range(0, hf - nb_h * BLOCK + 1, 16):
-                    for off_w in range(0, wf - nb_w * BLOCK + 1, 16):
-                        r = self._decode(Gf, key, cand, fsize, want_any=False,
-                                          grid_info=(nb_h, nb_w, off_h, off_w))
-                        if r is not None and r["magic_err"] < fbest_magic:
-                            fbest_magic = r["magic_err"]
-                            fbest_r = r
-                            if fbest_magic <= MAGIC_HAMMING:
-                                break
-                    if fbest_magic <= MAGIC_HAMMING:
-                        break
+            # 粗扫：步长16，覆盖主要偏移位置
+            off_h_range = range(-ref_nb_h * BLOCK // 2, hf, 16)
+            off_w_range = range(-ref_nb_w * BLOCK // 2, wf, 16)
+            for off_h in off_h_range:
+                for off_w in off_w_range:
+                    r = self._decode(Gf, key, cand, fsize, want_any=False,
+                                      grid_info=(ref_nb_h, ref_nb_w, off_h, off_w))
+                    if r is not None and r["magic_err"] < fbest_magic:
+                        fbest_magic = r["magic_err"]
+                        fbest_r = r
+                        if fbest_magic <= MAGIC_HAMMING:
+                            break
                 if fbest_magic <= MAGIC_HAMMING:
                     break
             if fbest_r is not None and self._is_hit(fbest_r):
@@ -899,21 +943,47 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
         ycbcr = cv2.cvtColor(G, cv2.COLOR_BGR2YCrCb).astype(np.float32)
         Y = ycbcr[:, :, 0]
         h, w = Y.shape
+        use_ref_map = False  # 是否使用参考坐标系映射（非对称裁切/负偏移时）
         if grid_info is not None:
             nb_h, nb_w, off_h, off_w = grid_info
-            # 验证块网格在图像范围内
-            if off_h < 0 or off_w < 0 or off_h + nb_h * BLOCK > h or off_w + nb_w * BLOCK > w:
+            # 允许负偏移：块网格左上角可能在图像外（非对称裁切）
+            # 计算可见像素范围
+            y0 = max(0, off_h)
+            y1 = min(h, off_h + nb_h * BLOCK)
+            x0 = max(0, off_w)
+            x1 = min(w, off_w + nb_w * BLOCK)
+            if y1 - y0 < BLOCK * 4 or x1 - x0 < BLOCK * 4:
+                return None  # 可见区域太小
+            # 可见块在块网格中的起始位置
+            start_r = (y0 - off_h) // BLOCK
+            start_c = (x0 - off_w) // BLOCK
+            vis_nb_h = (y1 - y0) // BLOCK
+            vis_nb_w = (x1 - x0) // BLOCK
+            if vis_nb_h * vis_nb_w < TOTAL_BITS // 2:
                 return None
+            # 如果有负偏移，使用参考坐标系映射
+            if off_h < 0 or off_w < 0:
+                use_ref_map = True
+                ref_nb_h = h // BLOCK
+                ref_nb_w = w // BLOCK
+                map_off_r = off_h // BLOCK + start_r
+                map_off_c = off_w // BLOCK + start_c
+            # 用可见部分替换块网格参数
+            nb_h, nb_w = vis_nb_h, vis_nb_w
+            off_h, off_w = y0, x0
         elif center:
             nb_h, nb_w, off_h, off_w = _grid_info(h, w, int(center[0]), int(center[1]))
         else:
             nb_h, nb_w, off_h, off_w = _grid_info(h, w)
         total = nb_h * nb_w
-        if total < TOTAL_BITS:
+        if total < TOTAL_BITS // 2:
             return None
 
         seed = _seed_from_key(key)
-        kmat = _bit_map(nb_w, nb_h, seed)          # (nb_h, nb_w)
+        if use_ref_map:
+            kmat = _bit_map(nb_w, nb_h, seed, ref_nb_h, ref_nb_w, map_off_r, map_off_c)
+        else:
+            kmat = _bit_map(nb_w, nb_h, seed)          # (nb_h, nb_w)
         Yg = Y[off_h: off_h + nb_h * BLOCK, off_w: off_w + nb_w * BLOCK]
         blocks = (Yg.reshape(nb_h, 8, nb_w, 8)
                   .transpose(0, 2, 1, 3).reshape(-1, 8, 8).astype(np.float64))
@@ -944,7 +1014,8 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
         if not want_any:
             return {"cand_size": cand_size, "magic_err": magic_err, "passed": passed,
                     "votes": votes, "bits": bits, "magic_got": magic_got,
-                    "sim": sim, "matched_content": best, "wm": wm_arr}
+                    "sim": sim, "matched_content": best, "wm": wm_arr,
+                    "grid_off_h": off_h, "grid_off_w": off_w}
         if not passed:
             return None
         return {"detected": True, "algorithm": self.name, "wm": wm_arr,
