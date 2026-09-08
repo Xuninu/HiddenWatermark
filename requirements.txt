@@ -1,0 +1,7 @@
+# 运行时依赖
+pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.9
+windnd>=1.0.7  # Windows 原生文件拖放（WM_DROPFILES）
+
+# 打包成 exe 时才需要（pip install pyinstaller）

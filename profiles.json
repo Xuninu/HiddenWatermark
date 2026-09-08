@@ -1,0 +1,32 @@
+{
+  "profiles": [
+    {
+      "name": "个人专属",
+      "algorithm": "data_append",
+      "owner": "我的名字",
+      "note": ""
+    },
+    {
+      "name": "团队标准",
+      "algorithm": "data_append",
+      "owner": "我的团队",
+      "note": "内部发布"
+    },
+    {
+      "name": "公开渠道",
+      "algorithm": "data_append",
+      "owner": "我的团队",
+      "note": "公开渠道"
+    },
+    {
+      "name": "抗篡改(频域)",
+      "algorithm": "frequency_dct",
+      "owner": "我的团队",
+      "note": "抗压缩/重编码",
+      "extra": {
+        "key": "my-secret-key",
+        "strength": 40
+      }
+    }
+  ]
+}
