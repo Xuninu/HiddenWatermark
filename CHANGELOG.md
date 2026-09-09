@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.3.1 (2026-09-09)
+
+### 重大 UI 修复：基于真实控件测量精确校准窗口最小尺寸
+
+**问题**：水印强度百分比、开始加水印按钮在窗口缩小时被裁切。
+
+**根因**（通过实际运行 GUI 用 `winfo_reqheight()` 测量发现，非估算）：
+1. `expand=True` 的 Canvas 未设置 height 参数，默认请求高度高达 267px，导致 PanedWindow 初始布局给文件列表/预览区分配过多空间，挤压其他窗口
+2. 强度百分比数字 `num` 在滑块条 `bar`（expand=True）之后 pack，被滑块条挤压裁切
+3. 各窗口 minsize 基于估算值，与真实渲染高度不符
+
+**修复**：
+1. 给三个 expand=True 的 Canvas 设置较小的初始 height，降低请求高度：
+   - 文件列表 grid_canvas：加 height=100（原默认267px）
+   - 图片预览 preview_canvas：加 height=100（原默认267px）
+   - 频域预览 freq_canvas：height 150→80
+2. 强度条 pack 顺序修正：百分比数字 num 先 pack(side="right") 固定右侧，滑块条 bar 后 pack(expand=True) 占据剩余空间，百分比不再被挤压
+3. 基于真实测量数据重新校准所有 minsize：
+
+| 窗口 | 真实内容高度 | 新 minsize | 余量 |
+|------|------------|-----------|------|
+| 文件列表 | 230px | 240px | 10px |
+| 动作窗口 | 190px | 200px | 10px |
+| 输出日志 | 155px | 165px | 10px |
+| 图片预览 | 193px | 200px | 7px |
+| 频域预览 | 140px | 150px | 10px |
+| 底部容器 | 91px | 100px(固定) | 9px |
+
+- 窗口总最小高度需求 758px，root.minsize=780px（余量22px）
+
+### 验证
+- 实际运行 GUI 用 winfo_reqheight() 测量所有控件真实高度
+- 6/6 窗口内容高度 < minsize
+- GUI `--smoke` 自检通过
+
 ## v0.3.0 (2026-09-09)
 
 ### 重大 UI 修复：所有窗口 minsize 重新校准，缩到最小时内容完整显示

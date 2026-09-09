@@ -363,7 +363,7 @@ class WatermarkApp:
 
         root.title("HiddenWatermark 图片隐藏水印")
         root.geometry("1180x1000")
-        root.minsize(1020, 820)
+        root.minsize(1020, 780)
         root.configure(bg=BG)
 
         # 变量
@@ -460,7 +460,7 @@ class WatermarkApp:
 
         # 文件列表卡片
         left = RoundedCard(left_pw)
-        left_pw.add(left, minsize=230)
+        left_pw.add(left, minsize=240)
         self._card_head(left.content, "文件列表", show_count=True)
 
         btns = tk.Frame(left.content, bg=CARD)
@@ -490,7 +490,7 @@ class WatermarkApp:
         tree_wrap = tk.Frame(left.content, bg=CARD)
         tree_wrap.pack(fill="both", expand=True, padx=14, pady=(2, 14))
         self.grid_canvas = tk.Canvas(tree_wrap, bg="#FFFFFF", highlightthickness=1,
-                                     highlightbackground=BORDER, width=500)
+                                     highlightbackground=BORDER, width=500, height=100)
         gsb = tk.Scrollbar(tree_wrap, command=self.grid_canvas.yview)
         self.grid_canvas.configure(yscrollcommand=gsb.set)
         self.grid_canvas.bind("<Configure>", lambda e: self._on_grid_resize())
@@ -503,7 +503,7 @@ class WatermarkApp:
 
         # 动作卡片
         act = RoundedCard(left_pw)
-        left_pw.add(act, minsize=210)
+        left_pw.add(act, minsize=200)
         self._card_head(act.content, "动作：添加隐藏水印", hint="选择要叠加的水印类型")
 
         arow1 = tk.Frame(act.content, bg=CARD)
@@ -543,7 +543,7 @@ class WatermarkApp:
 
         # 输出 + 日志卡片
         bottom = RoundedCard(left_pw)
-        left_pw.add(bottom, minsize=170)
+        left_pw.add(bottom, minsize=165)
         self._card_head(bottom.content, "输出与运行日志")
         orow = tk.Frame(bottom.content, bg=CARD)
         orow.pack(fill="x", padx=14, pady=(8, 6))
@@ -604,7 +604,7 @@ class WatermarkApp:
         pv = tk.Frame(self.right_pw, bg=CARD)
         self.right_pw.add(pv, minsize=200)
         self.preview_canvas = tk.Canvas(pv, bg="#FFFFFF", highlightthickness=1,
-                                        highlightbackground=BORDER, width=900)
+                                        highlightbackground=BORDER, width=900, height=100)
         self.preview_canvas.bind("<Configure>", lambda e: self._on_preview_resize())
         self.preview_info = tk.Label(pv, text="未选择文件（滚轮缩放 · 中键拖拽查看）", bg=CARD, fg=MUTED,
                                      font=UI, anchor="w")
@@ -625,7 +625,7 @@ class WatermarkApp:
         tk.Label(fp, text="频域水印预览（水印内容提取/预览）", bg=CARD, fg=ACCENT,
                  font=UI_BOLD, anchor="w").pack(fill="x", padx=2, pady=(0, 2))
         self.freq_canvas = tk.Canvas(fp, bg="#FFFFFF", highlightthickness=1,
-                                     highlightbackground=BORDER, height=150)
+                                     highlightbackground=BORDER, height=80)
         self.freq_info = tk.Label(fp, text="勾选频域水印并选择图片后，这里显示水印内容预览/提取结果", bg=CARD,
                                   fg=MUTED, font=UI, anchor="w")
         self.freq_info.pack(fill="x", side="bottom", padx=2, pady=(0, 4))
@@ -635,7 +635,7 @@ class WatermarkApp:
         self._clear_previews()
 
         # 底部容器：状态栏 + 开始加水印按钮（固定高度90px，不被主体面板挤压裁切）
-        bottom_bar = tk.Frame(self.root, bg=BG, height=105)
+        bottom_bar = tk.Frame(self.root, bg=BG, height=100)
         bottom_bar.pack(side="bottom", fill="x")
         bottom_bar.pack_propagate(False)
         self.status = tk.Label(bottom_bar, text="就绪", anchor="w", bg=HEADER_BG, fg=MUTED,
@@ -736,11 +736,11 @@ class WatermarkApp:
     def _strength_bar(self, parent, var):
         """简约蓝色百分比条：响应式宽度，点击/拖动设置强度，右侧显示百分比。"""
         wrap = tk.Frame(parent, bg=CARD)
+        num = tk.Label(wrap, text="40%", width=5, bg=CARD, fg=TEXT,
+                       font=("Microsoft YaHei UI", 9, "bold"), anchor="e")
+        num.pack(side="right", padx=(8, 2))
         bar = tk.Canvas(wrap, height=22, bg=CARD, highlightthickness=0)
         bar.pack(side="left", fill="x", expand=True)
-        num = tk.Label(wrap, text="40%", width=5, bg=CARD, fg=TEXT,
-                       font=("Microsoft YaHei UI", 9, "bold"), anchor="w")
-        num.pack(side="left", padx=(8, 0))
 
         BH, RH = 22, 9  # 条高/条厚
 
