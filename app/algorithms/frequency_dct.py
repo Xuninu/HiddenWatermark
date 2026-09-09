@@ -49,6 +49,11 @@ MAGIC_ERR_TH = 3          # magic 允许位错（实测真实水印 max=1）
 NB_MAX_H, NB_MAX_W = 130, 132
 SCALE_NEIGH = 3           # 精搜尺度邻域 ±3 块
 
+# 旋转校正：截图工具(Snipaste等)可能引入0.3~0.8度微小旋转，导致DCT块对齐失效
+ROT_RANGE = 2.0           # 搜索角度范围 ±2度
+ROT_STEP_COARSE = 0.4     # 粗搜步长
+ROT_STEP_FINE = 0.1       # 精搜步长（在最优角度±0.4范围内）
+
 # 兼容旧引用（GUI / 实验脚本）
 WM_W, WM_H = 40, 10
 CONTENT_BITS = WM_W * WM_H
@@ -310,6 +315,33 @@ def _eval_offset(Yall, nh, nw, oy, ox, fc_conj, spn_s, data_pos, msign):
     return best
 
 
+def _rotate_img(img, angle):
+    """绕中心旋转微小角度（边缘复制填充，避免黑边引入噪声）。"""
+    h, w = img.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_REPLICATE)
+
+
+def _coarse_z_at(img, tmpl, ar):
+    """在给定图片上粗搜尺度(步长4块)，返回最高Z。用于旋转角度快速筛选。"""
+    best_z = 0.0
+    for nh in range(T, NB_MAX_H, 4):
+        nw0 = round(nh * ar)
+        for nw in range(max(T, nw0 - 2), min(NB_MAX_W, nw0 + 3)):
+            Gr = cv2.resize(img, (nw * BLOCK, nh * BLOCK), interpolation=cv2.INTER_LINEAR)
+            Y = cv2.cvtColor(Gr, cv2.COLOR_BGR2YCrCb)[:, :, 0].astype(np.float64)
+            diff = _dct_diff(Y, nh, nw)
+            acc = _fold_z(diff, tmpl)
+            flat = acc.ravel()
+            im = flat.argmax()
+            bg = np.delete(flat, im)
+            z = (flat[im] - bg.mean()) / (bg.std() + 1e-9)
+            if z > best_z:
+                best_z = z
+    return best_z
+
+
 def _decode_core(crop, key):
     """在任意裁切截图上盲解码。返回 dict(z, magic_err, content_bits, conf) 或 None（未命中）。"""
     _, data_pos, spn, magic_exp = _layout(key)
@@ -318,6 +350,31 @@ def _decode_core(crop, key):
     if ch < BLOCK * T // 2 or cw < BLOCK * T // 2:
         return None
     ar = cw / ch
+
+    # ---- 0) 旋转校正：截图工具(Snipaste等)可能引入0.3~0.8度微小旋转，破坏DCT块对齐 ----
+    # 0度快速预检：Z已很高(>8)则跳过旋转搜索，避免正常图片增加耗时
+    z0 = _coarse_z_at(crop, tmpl, ar)
+    best_angle = 0.0
+    if z0 < 8.0:
+        best_rot_z = z0
+        # 粗搜旋转角度（步长0.4度）
+        for angle in np.arange(-ROT_RANGE, ROT_RANGE + 0.01, ROT_STEP_COARSE):
+            if abs(angle) < 0.01:
+                continue
+            z = _coarse_z_at(_rotate_img(crop, angle), tmpl, ar)
+            if z > best_rot_z:
+                best_rot_z = z
+                best_angle = angle
+        # 精搜旋转角度（最优角度±0.4范围内，步长0.1度）
+        for angle in np.arange(best_angle - 0.4, best_angle + 0.41, ROT_STEP_FINE):
+            if abs(angle - best_angle) < 0.01:
+                continue
+            z = _coarse_z_at(_rotate_img(crop, angle), tmpl, ar)
+            if z > best_rot_z:
+                best_rot_z = z
+                best_angle = angle
+        if abs(best_angle) > 0.01:
+            crop = _rotate_img(crop, best_angle)
 
     # ---- 1) 粗搜尺度（步长 2 块，块起点 0）：x/y 独立，覆盖非等比裁切 ----
     cands = []
