@@ -363,7 +363,7 @@ class WatermarkApp:
 
         root.title("HiddenWatermark 图片隐藏水印")
         root.geometry("1180x1000")
-        root.minsize(1020, 780)
+        root.minsize(1020, 820)
         root.configure(bg=BG)
 
         # 变量
@@ -460,7 +460,7 @@ class WatermarkApp:
 
         # 文件列表卡片
         left = RoundedCard(left_pw)
-        left_pw.add(left, minsize=180)
+        left_pw.add(left, minsize=230)
         self._card_head(left.content, "文件列表", show_count=True)
 
         btns = tk.Frame(left.content, bg=CARD)
@@ -503,7 +503,7 @@ class WatermarkApp:
 
         # 动作卡片
         act = RoundedCard(left_pw)
-        left_pw.add(act, minsize=230)
+        left_pw.add(act, minsize=210)
         self._card_head(act.content, "动作：添加隐藏水印", hint="选择要叠加的水印类型")
 
         arow1 = tk.Frame(act.content, bg=CARD)
@@ -543,7 +543,7 @@ class WatermarkApp:
 
         # 输出 + 日志卡片
         bottom = RoundedCard(left_pw)
-        left_pw.add(bottom, minsize=150)
+        left_pw.add(bottom, minsize=170)
         self._card_head(bottom.content, "输出与运行日志")
         orow = tk.Frame(bottom.content, bg=CARD)
         orow.pack(fill="x", padx=14, pady=(8, 6))
@@ -602,7 +602,7 @@ class WatermarkApp:
         self.right_pw.pack(fill="both", expand=True, padx=14, pady=(0, 4))
 
         pv = tk.Frame(self.right_pw, bg=CARD)
-        self.right_pw.add(pv, minsize=160)
+        self.right_pw.add(pv, minsize=200)
         self.preview_canvas = tk.Canvas(pv, bg="#FFFFFF", highlightthickness=1,
                                         highlightbackground=BORDER, width=900)
         self.preview_canvas.bind("<Configure>", lambda e: self._on_preview_resize())
@@ -621,7 +621,7 @@ class WatermarkApp:
         self._wm_card.place(x=6, y=6)
 
         fp = tk.Frame(self.right_pw, bg=CARD)
-        self.right_pw.add(fp, minsize=130)
+        self.right_pw.add(fp, minsize=150)
         tk.Label(fp, text="频域水印预览（水印内容提取/预览）", bg=CARD, fg=ACCENT,
                  font=UI_BOLD, anchor="w").pack(fill="x", padx=2, pady=(0, 2))
         self.freq_canvas = tk.Canvas(fp, bg="#FFFFFF", highlightthickness=1,
@@ -635,7 +635,7 @@ class WatermarkApp:
         self._clear_previews()
 
         # 底部容器：状态栏 + 开始加水印按钮（固定高度90px，不被主体面板挤压裁切）
-        bottom_bar = tk.Frame(self.root, bg=BG, height=90)
+        bottom_bar = tk.Frame(self.root, bg=BG, height=105)
         bottom_bar.pack(side="bottom", fill="x")
         bottom_bar.pack_propagate(False)
         self.status = tk.Label(bottom_bar, text="就绪", anchor="w", bg=HEADER_BG, fg=MUTED,
