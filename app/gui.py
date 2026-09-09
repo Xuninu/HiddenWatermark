@@ -503,7 +503,7 @@ class WatermarkApp:
 
         # 动作卡片
         act = RoundedCard(left_pw)
-        left_pw.add(act, minsize=210)
+        left_pw.add(act, minsize=230)
         self._card_head(act.content, "动作：添加隐藏水印", hint="选择要叠加的水印类型")
 
         arow1 = tk.Frame(act.content, bg=CARD)
@@ -621,7 +621,7 @@ class WatermarkApp:
         self._wm_card.place(x=6, y=6)
 
         fp = tk.Frame(self.right_pw, bg=CARD)
-        self.right_pw.add(fp, minsize=90)
+        self.right_pw.add(fp, minsize=130)
         tk.Label(fp, text="频域水印预览（水印内容提取/预览）", bg=CARD, fg=ACCENT,
                  font=UI_BOLD, anchor="w").pack(fill="x", padx=2, pady=(0, 2))
         self.freq_canvas = tk.Canvas(fp, bg="#FFFFFF", highlightthickness=1,
@@ -634,9 +634,10 @@ class WatermarkApp:
         self._bind_view_controls(self.freq_canvas)
         self._clear_previews()
 
-        # 底部容器：状态栏 + 开始加水印按钮（固定在底部，不被主体面板挤压裁切）
-        bottom_bar = tk.Frame(self.root, bg=BG)
+        # 底部容器：状态栏 + 开始加水印按钮（固定高度90px，不被主体面板挤压裁切）
+        bottom_bar = tk.Frame(self.root, bg=BG, height=90)
         bottom_bar.pack(side="bottom", fill="x")
+        bottom_bar.pack_propagate(False)
         self.status = tk.Label(bottom_bar, text="就绪", anchor="w", bg=HEADER_BG, fg=MUTED,
                                font=UI, padx=16, pady=5, highlightbackground=BORDER,
                                highlightthickness=1)
@@ -681,8 +682,17 @@ class WatermarkApp:
         tk.Label(head, text=text, bg=CARD, fg=TEXT, font=UI_BOLD, anchor="w").pack(
             side="left", padx=14, pady=8)
         if hint:
-            tk.Label(head, text=hint, bg=CARD, fg=MUTED,
-                     font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(8, 0), pady=8)
+            hint_lbl = tk.Label(head, text=hint, bg=CARD, fg=MUTED,
+                                 font=("Microsoft YaHei UI", 9), anchor="w", justify="left")
+            hint_lbl.pack(side="left", padx=(8, 14), pady=8, fill="x", expand=True)
+            # 窗口宽度变化时自动调整换行宽度，避免文字被裁切
+            def _adjust_hint_wrap(e=None, lbl=hint_lbl):
+                try:
+                    w = max(80, head.winfo_width() - 200)
+                    lbl.config(wraplength=w)
+                except Exception:
+                    pass
+            head.bind("<Configure>", _adjust_hint_wrap)
         if show_count:
             self.count_lbl = tk.Label(head, text="0 个文件", bg="#E2E8F0", fg="#475569",
                                       font=("Microsoft YaHei UI", 9), padx=8, pady=1)
