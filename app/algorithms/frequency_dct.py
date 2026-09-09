@@ -357,6 +357,84 @@ def _decode_core(crop, key, mode='enhanced'):
         return None
     ar = cw / ch
 
+    # ---- 快速模式：假设图片未裁切，固定尺度±4小范围搜索，每尺度做内容解码，选最优 ----
+    # 适用于调色/滤镜/缩放等未裁切的图片；不适用裁切/截图（请用增强模式）
+    # 注意：Z最高的尺度不一定内容解码最准，因此对所有候选尺度做内容解码，选magic_err最小+conf最高
+    if mode == 'fast':
+        msign = (2 * magic_exp.astype(np.float64) - 1)
+        magic_pos = data_pos[CONTENT_N:]
+        C = np.zeros(N)
+        C[magic_pos] = msign * np.sign(spn[magic_pos])
+        fc_conj = np.conj(np.fft.fft2(C.reshape(T, T)))
+        spn_s = np.sign(spn)
+        # 固定尺度中心：长边128块（=1024px，与嵌入时REF_LONG一致）
+        if ar < 1:  # 竖图
+            nh0 = min(NB_MAX_H, 128)
+            nw0 = max(T, min(NB_MAX_W, round(nh0 * ar)))
+        else:  # 横图/方图
+            nw0 = min(NB_MAX_W, 128)
+            nh0 = max(T, min(NB_MAX_H, round(nw0 / ar)))
+        # 对±4块范围内的每个尺度做粗偏移搜索+内容解码，记录最优
+        scale_results = []  # (magic_err, -conf, nh, nw, oy, ox, bits)
+        for dh in (-4, -3, -2, -1, 0, 1, 2, 3, 4):
+            nh = nh0 + dh
+            if nh < T or nh >= NB_MAX_H:
+                continue
+            nw = max(T, min(NB_MAX_W, round(nh * ar)))
+            Gr = cv2.resize(crop, (nw * BLOCK + 7, nh * BLOCK + 7), interpolation=cv2.INTER_LINEAR)
+            Yall = cv2.cvtColor(Gr, cv2.COLOR_BGR2YCrCb)[:, :, 0].astype(np.float64)
+            scale_best = (-1e18, None, 0, 0)
+            for oy in (0, 2, 4, 6):
+                for ox in (0, 2, 4, 6):
+                    conf, bits = _eval_offset(Yall, nh, nw, oy, ox, fc_conj, spn_s, data_pos, msign)
+                    if conf > scale_best[0]:
+                        scale_best = (conf, bits, oy, ox)
+            conf, bits, oy, ox = scale_best
+            if bits is None:
+                continue
+            content_bits = bits[:CONTENT_N]
+            magic_got = bits[CONTENT_N:]
+            magic_err = int(np.count_nonzero(magic_got != magic_exp))
+            scale_results.append((magic_err, -conf, nh, nw, oy, ox, bits))
+        if not scale_results:
+            return None
+        # 选magic_err最小、conf最高的top2尺度做全像素细化
+        scale_results.sort()
+        top2 = scale_results[:2]
+        best = None  # (magic_err, -conf, nh, nw, oy, ox, bits)
+        for _me, _nc, nh, nw, oy0, ox0, _b in top2:
+            Gr = cv2.resize(crop, (nw * BLOCK + 7, nh * BLOCK + 7), interpolation=cv2.INTER_LINEAR)
+            Yall = cv2.cvtColor(Gr, cv2.COLOR_BGR2YCrCb)[:, :, 0].astype(np.float64)
+            for oy in range(max(0, oy0 - 1), min(BLOCK, oy0 + 2)):
+                for ox in range(max(0, ox0 - 1), min(BLOCK, ox0 + 2)):
+                    conf, bits = _eval_offset(Yall, nh, nw, oy, ox, fc_conj, spn_s, data_pos, msign)
+                    if bits is None:
+                        continue
+                    magic_got = bits[CONTENT_N:]
+                    magic_err = int(np.count_nonzero(magic_got != magic_exp))
+                    cand = (magic_err, -conf, nh, nw, oy, ox, bits)
+                    if best is None or cand < best:
+                        best = cand
+        if best is None:
+            return None
+        magic_err, neg_conf, nh, nw, oy, ox, bits = best
+        conf = -neg_conf
+        # 快速模式命中条件：conf>3.3（未裁切图conf≈3.95，裁切图conf<3.3）且magic_err≤3
+        if magic_err > MAGIC_ERR_TH or conf < 3.3:
+            return None
+        content_bits = bits[:CONTENT_N]
+        # 快速模式用最优尺度的Z作为sync_z（重新计算）
+        Gr = cv2.resize(crop, (nw * BLOCK, nh * BLOCK), interpolation=cv2.INTER_LINEAR)
+        Y = cv2.cvtColor(Gr, cv2.COLOR_BGR2YCrCb)[:, :, 0].astype(np.float64)
+        diff = _dct_diff(Y, nh, nw)
+        acc = _fold_z(diff, tmpl)
+        flat = acc.ravel()
+        im = flat.argmax()
+        bg = np.delete(flat, im)
+        z = (flat[im] - bg.mean()) / (bg.std() + 1e-9)
+        return {"z": float(z), "magic_err": magic_err,
+                "content_bits": content_bits, "conf": conf}
+
     # ---- 0) 旋转校正：截图工具(Snipaste等)可能引入0.3~0.8度微小旋转，破坏DCT块对齐 ----
     # 0度快速预检（步长4确保精度）
     z0 = _coarse_z_at(crop, tmpl, ar, step=4)
