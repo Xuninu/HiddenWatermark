@@ -598,6 +598,8 @@ class WatermarkApp:
             activebackground=ACCENT, activeforeground="#FFFFFF", cursor="hand2",
             command=lambda: self._set_detect_mode("enhanced"))
         self._mode_enh_btn.pack(side="left", padx=(0, 1), pady=1)
+        # 同步按钮视觉状态与默认检测模式(fast)
+        self._on_detect_mode_change()
         self.right_pw = tk.PanedWindow(right.content, orient="vertical", sashwidth=6, sashrelief="flat", bg=BG, showhandle=False, borderwidth=0)
         self.right_pw.pack(fill="both", expand=True, padx=14, pady=(0, 4))
 
