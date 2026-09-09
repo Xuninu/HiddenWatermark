@@ -347,7 +347,7 @@ class WatermarkApp:
         self.freq_content_var = tk.StringVar(value="")
         self.strength_var = tk.IntVar(value=40)
         self.key_var = tk.StringVar(value="my-secret-key")
-        self.detect_mode_var = tk.StringVar(value="enhanced")
+        self.detect_mode_var = tk.StringVar(value="fast")
         self.output_var = tk.StringVar(value=self._desktop_dir())
         # 预览水印检测缓存：key=文件路径
         self._marker_cache = {}   # path -> 标记水印内容 dict / None / {"_error": ...}
@@ -501,16 +501,6 @@ class WatermarkApp:
         _w3.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self._strength_bar(_w3, self.strength_var).pack(fill="x")
 
-        arow3b = tk.Frame(act.content, bg=CARD)
-        arow3b.pack(fill="x", padx=14, pady=(0, 6))
-        tk.Label(arow3b, text="检测模式", bg=CARD, fg=MUTED, font=UI).pack(side="left")
-        tk.Radiobutton(arow3b, text="快速", variable=self.detect_mode_var, value="fast",
-                        bg=CARD, fg=TEXT, font=UI, selectcolor=ACCENT, activebackground=CARD).pack(side="left", padx=(12, 0))
-        tk.Radiobutton(arow3b, text="增强", variable=self.detect_mode_var, value="enhanced",
-                        bg=CARD, fg=TEXT, font=UI, selectcolor=ACCENT, activebackground=CARD).pack(side="left", padx=(8, 0))
-        tk.Label(arow3b, text="快速≈3秒不搜旋转 / 增强≈5秒多线程搜旋转",
-                 bg=CARD, fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(12, 0))
-
         arow4 = tk.Frame(act.content, bg=CARD)
         arow4.pack(fill="x", padx=14, pady=(0, 12))
         tk.Label(arow4, text="密钥", bg=CARD, fg=MUTED, font=UI).pack(side="left")
@@ -565,6 +555,21 @@ class WatermarkApp:
                       font=("Microsoft YaHei UI", 9)).pack(side="right", padx=(0, 8))
         self._check(zoom_bar, "显示水印", self.show_wm_var, cmd=self._on_show_wm_toggle).pack(
             side="right", padx=(0, 10))
+        tk.Label(zoom_bar, text="检测模式", bg=CARD, fg=MUTED, font=("Microsoft YaHei UI", 9)).pack(
+            side="right", padx=(0, 6))
+        # 分段切换控件：两个按钮连在一起，选中高亮蓝色
+        mode_seg = tk.Frame(zoom_bar, bg=BORDER, highlightthickness=0)
+        mode_seg.pack(side="right", padx=(0, 8))
+        self._mode_fast_btn = tk.Button(mode_seg, text="快速", bg=CARD, fg=TEXT,
+            font=("Microsoft YaHei UI", 9), relief="flat", bd=0, padx=10, pady=2,
+            activebackground=ACCENT, activeforeground="#FFFFFF", cursor="hand2",
+            command=lambda: self._set_detect_mode("fast"))
+        self._mode_fast_btn.pack(side="left", padx=(1, 0), pady=1)
+        self._mode_enh_btn = tk.Button(mode_seg, text="增强", bg=ACCENT, fg="#FFFFFF",
+            font=("Microsoft YaHei UI", 9), relief="flat", bd=0, padx=10, pady=2,
+            activebackground=ACCENT, activeforeground="#FFFFFF", cursor="hand2",
+            command=lambda: self._set_detect_mode("enhanced"))
+        self._mode_enh_btn.pack(side="left", padx=(0, 1), pady=1)
         self.right_pw = tk.PanedWindow(right.content, orient="vertical", sashwidth=6, sashrelief="flat", bg=BG, showhandle=False, borderwidth=0)
         self.right_pw.pack(fill="both", expand=True, padx=14, pady=(0, 4))
 
@@ -601,17 +606,20 @@ class WatermarkApp:
         self._bind_view_controls(self.freq_canvas)
         self._clear_previews()
 
-        # 开始加水印按钮（圆角大按钮）
-        self.run_btn = RoundedButton(self.root, "开始加水印", self._run, fill=ACCENT, fg="white",
-                                      active_fill=ACCENT_HOVER, width=180, height=38, radius=10,
-                                      font=UI_BOLD, bg=BG)
-
-        # ===== 打包顺序：先底部状态栏/按钮，再工具栏，最后主体 =====
-        self.status = tk.Label(self.root, text="就绪", anchor="w", bg=HEADER_BG, fg=MUTED,
+        # 底部容器：状态栏 + 开始加水印按钮（固定在底部，不被主体面板挤压裁切）
+        bottom_bar = tk.Frame(self.root, bg=BG)
+        bottom_bar.pack(side="bottom", fill="x")
+        self.status = tk.Label(bottom_bar, text="就绪", anchor="w", bg=HEADER_BG, fg=MUTED,
                                font=UI, padx=16, pady=5, highlightbackground=BORDER,
                                highlightthickness=1)
         self.status.pack(fill="x", side="bottom")
-        self.run_btn.pack(side="bottom", pady=(0, 12))
+        # 开始加水印按钮（圆角大按钮）
+        self.run_btn = RoundedButton(bottom_bar, "开始加水印", self._run, fill=ACCENT, fg="white",
+                                      active_fill=ACCENT_HOVER, width=180, height=38, radius=10,
+                                      font=UI_BOLD, bg=BG)
+        self.run_btn.pack(side="bottom", pady=(8, 10))
+
+        # ===== 打包顺序：工具栏，最后主体 =====
         toolbar.pack(fill="x", padx=16, pady=(12, 0))
         # 初始面板比例（延迟到窗口显示后设置 sash 位置）
         self.root.after_idle(lambda: self._init_sash(main_pw, left_pw, self.right_pw))
@@ -1347,6 +1355,29 @@ class WatermarkApp:
     def _on_show_wm_toggle(self):
         # 卡片独立于图片渲染，只需显示/隐藏，无需重画整张图
         self._update_wm_card()
+
+    def _set_detect_mode(self, mode):
+        """设置检测模式并更新分段按钮高亮状态，然后重新检测。"""
+        self.detect_mode_var.set(mode)
+        self._update_mode_buttons()
+        self._on_detect_mode_change()
+
+    def _update_mode_buttons(self):
+        """更新分段切换按钮的高亮状态：选中=蓝底白字，未选中=灰底深字。"""
+        mode = self.detect_mode_var.get()
+        if mode == "fast":
+            self._mode_fast_btn.config(bg=ACCENT, fg="#FFFFFF", relief="flat")
+            self._mode_enh_btn.config(bg=CARD, fg=TEXT, relief="flat")
+        else:
+            self._mode_fast_btn.config(bg=CARD, fg=TEXT, relief="flat")
+            self._mode_enh_btn.config(bg=ACCENT, fg="#FFFFFF", relief="flat")
+
+    def _on_detect_mode_change(self):
+        """切换检测模式后，清除当前预览图片的频域缓存并重新检测。"""
+        if self._preview_path and self._preview_path in self._freq_cache:
+            del self._freq_cache[self._preview_path]
+        if self._preview_path and self.freq_var.get():
+            self._start_freq_detect(self._preview_path)
 
     def _refresh_detect(self):
         """清空该图缓存，强制重新识别标记水印 + 频域水印（用于实时检测不准时手动兜底）。"""
