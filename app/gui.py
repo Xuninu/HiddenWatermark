@@ -363,7 +363,7 @@ class WatermarkApp:
 
         root.title("HiddenWatermark 图片隐藏水印")
         root.geometry("1180x1000")
-        root.minsize(1020, 780)
+        root.minsize(1020, 820)
         root.configure(bg=BG)
 
         # 变量
