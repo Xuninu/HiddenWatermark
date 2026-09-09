@@ -419,8 +419,8 @@ def _decode_core(crop, key, mode='enhanced'):
             return None
         magic_err, neg_conf, nh, nw, oy, ox, bits = best
         conf = -neg_conf
-        # 快速模式命中条件：conf>3.3（未裁切图conf≈3.95，裁切图conf<3.3）且magic_err≤3
-        if magic_err > MAGIC_ERR_TH or conf < 3.3:
+        # 快速模式命中条件：conf>3.5（未裁切图conf≈3.95，无水印图conf上限3.37）且magic_err≤3
+        if magic_err > MAGIC_ERR_TH or conf < 3.5:
             return None
         content_bits = bits[:CONTENT_N]
         # 快速模式用最优尺度的Z作为sync_z（重新计算）
