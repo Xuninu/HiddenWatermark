@@ -347,6 +347,7 @@ class WatermarkApp:
         self.freq_content_var = tk.StringVar(value="")
         self.strength_var = tk.IntVar(value=40)
         self.key_var = tk.StringVar(value="my-secret-key")
+        self.detect_mode_var = tk.StringVar(value="enhanced")
         self.output_var = tk.StringVar(value=self._desktop_dir())
         # 预览水印检测缓存：key=文件路径
         self._marker_cache = {}   # path -> 标记水印内容 dict / None / {"_error": ...}
@@ -499,6 +500,16 @@ class WatermarkApp:
         _w3 = tk.Frame(arow3, bg=CARD)
         _w3.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self._strength_bar(_w3, self.strength_var).pack(fill="x")
+
+        arow3b = tk.Frame(act.content, bg=CARD)
+        arow3b.pack(fill="x", padx=14, pady=(0, 6))
+        tk.Label(arow3b, text="检测模式", bg=CARD, fg=MUTED, font=UI).pack(side="left")
+        tk.Radiobutton(arow3b, text="快速", variable=self.detect_mode_var, value="fast",
+                        bg=CARD, fg=TEXT, font=UI, selectcolor=ACCENT, activebackground=CARD).pack(side="left", padx=(12, 0))
+        tk.Radiobutton(arow3b, text="增强", variable=self.detect_mode_var, value="enhanced",
+                        bg=CARD, fg=TEXT, font=UI, selectcolor=ACCENT, activebackground=CARD).pack(side="left", padx=(8, 0))
+        tk.Label(arow3b, text="快速≈3秒不搜旋转 / 增强≈5秒多线程搜旋转",
+                 bg=CARD, fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(side="left", padx=(12, 0))
 
         arow4 = tk.Frame(act.content, bg=CARD)
         arow4.pack(fill="x", padx=14, pady=(0, 12))
@@ -1206,7 +1217,7 @@ class WatermarkApp:
         return self._marker_cache[path]
 
     def _detect_freq_core(self, path, marker_info, owner, cur_key, cur_content, strength,
-                          known_keys, known_contents=None):
+                          known_keys, known_contents=None, mode='enhanced'):
         """自动识别一张图的频域水印并盲提取内容（纯计算，不碰 Tk，可在工作线程调用）。
 
         候选密钥：标记里记录的 freq_key → 当前输入 → 历史密钥 → 默认密钥。
@@ -1244,7 +1255,7 @@ class WatermarkApp:
             tried.append(k)
             prof = WatermarkProfile(name="频域水印", algorithm="frequency_dct", owner=owner,
                                     note="", extra={"key": k, "strength": use_strength,
-                                                    "cand_contents": cand_contents})
+                                                    "cand_contents": cand_contents, "mode": mode})
             try:
                 r = self.engine.verify(path, profile=prof)
             except Exception:
@@ -1264,6 +1275,7 @@ class WatermarkApp:
         cur_key = self.key_var.get().strip() or "my-secret-key"
         cur_content = self.freq_content_var.get().strip() or None
         strength = self.strength_var.get()
+        mode = self.detect_mode_var.get()
         known = list(self._known_keys)
         known_contents = list(self._known_contents)
         marker = self._get_marker_info(path)
@@ -1271,7 +1283,7 @@ class WatermarkApp:
         def work():
             try:
                 result, _tried = self._detect_freq_core(path, marker, owner, cur_key, cur_content,
-                                                        strength, known, known_contents)
+                                                        strength, known, known_contents, mode=mode)
                 if result is None:
                     result = {"detected": False, "tried": _tried}   # 未命中也是确定结果
             except Exception as e:

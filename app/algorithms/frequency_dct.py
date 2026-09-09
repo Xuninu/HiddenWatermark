@@ -19,6 +19,7 @@
   - 不抗旋转（需求明确不需要）；非等比「拉伸变形」通过 x/y 独立尺度搜索可覆盖常见范围；
   - 算法换代后旧版水印无法被本版识别，已加水印图片需重新添加。
 """
+import concurrent.futures
 import hashlib
 import os
 import zlib
@@ -345,8 +346,10 @@ def _coarse_z_at(img, tmpl, ar, step=6):
     return best_z
 
 
-def _decode_core(crop, key):
-    """在任意裁切截图上盲解码。返回 dict(z, magic_err, content_bits, conf) 或 None（未命中）。"""
+def _decode_core(crop, key, mode='enhanced'):
+    """在任意裁切截图上盲解码。返回 dict(z, magic_err, content_bits, conf) 或 None（未命中）。
+    mode='fast': 不搜索旋转，2~3秒，适合无旋转的正常图片。
+    mode='enhanced': 0度不命中时多线程搜索旋转角度，4~6秒，适合截图等有旋转的图片。"""
     _, data_pos, spn, magic_exp = _layout(key)
     tmpl = _build_template(key)
     ch, cw = crop.shape[:2]
@@ -355,33 +358,45 @@ def _decode_core(crop, key):
     ar = cw / ch
 
     # ---- 0) 旋转校正：截图工具(Snipaste等)可能引入0.3~0.8度微小旋转，破坏DCT块对齐 ----
-    # 0度快速预检（步长4确保精度）：Z已很高(>6)则跳过旋转搜索，避免正常图片增加耗时
+    # 0度快速预检（步长4确保精度）
     z0 = _coarse_z_at(crop, tmpl, ar, step=4)
     best_angle = 0.0
-    if z0 < 6.0:
+    # fast模式：不搜索旋转，直接用0度（2~3秒）
+    # enhanced模式：0度Z<6时多线程搜索旋转角度（4~6秒）
+    if mode == 'enhanced' and z0 < 6.0:
         best_rot_z = z0
-        # 粗搜旋转角度（步长0.5度），提前终止：某角度Z>8直接采用
-        for angle in np.arange(-ROT_RANGE, ROT_RANGE + 0.01, ROT_STEP_COARSE):
-            if abs(angle) < 0.01:
-                continue
-            z = _coarse_z_at(_rotate_img(crop, angle), tmpl, ar)
-            if z > best_rot_z:
-                best_rot_z = z
-                best_angle = angle
-            if best_rot_z >= ROT_FAST_Z:
-                break   # 提前终止：已找到足够好的角度
-        # 精搜旋转角度（最优角度±0.3范围内，步长0.1度），同样提前终止
-        if best_rot_z < ROT_FAST_Z:
-            for angle in np.arange(best_angle - ROT_FINE_RANGE,
-                                    best_angle + ROT_FINE_RANGE + 0.01, ROT_STEP_FINE):
-                if abs(angle - best_angle) < 0.01:
+        # 粗搜旋转角度（多线程并行，步长0.5度）
+        coarse_angles = [a for a in np.arange(-ROT_RANGE, ROT_RANGE + 0.01, ROT_STEP_COARSE)
+                          if abs(a) >= 0.01]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(coarse_angles))) as ex:
+            futures = {ex.submit(_coarse_z_at, _rotate_img(crop, a), tmpl, ar): a
+                       for a in coarse_angles}
+            for fut in concurrent.futures.as_completed(futures):
+                a = futures[fut]
+                try:
+                    z = fut.result()
+                except Exception:
                     continue
-                z = _coarse_z_at(_rotate_img(crop, angle), tmpl, ar)
                 if z > best_rot_z:
                     best_rot_z = z
-                    best_angle = angle
-                if best_rot_z >= ROT_FAST_Z:
-                    break
+                    best_angle = a
+        # 精搜旋转角度（最优角度±0.3范围内，步长0.1度，多线程并行）
+        if best_rot_z < ROT_FAST_Z:
+            fine_angles = [a for a in np.arange(best_angle - ROT_FINE_RANGE,
+                                                  best_angle + ROT_FINE_RANGE + 0.01, ROT_STEP_FINE)
+                            if abs(a - best_angle) >= 0.01]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(fine_angles))) as ex:
+                futures = {ex.submit(_coarse_z_at, _rotate_img(crop, a), tmpl, ar): a
+                           for a in fine_angles}
+                for fut in concurrent.futures.as_completed(futures):
+                    a = futures[fut]
+                    try:
+                        z = fut.result()
+                    except Exception:
+                        continue
+                    if z > best_rot_z:
+                        best_rot_z = z
+                        best_angle = a
         if abs(best_angle) > 0.01:
             crop = _rotate_img(crop, best_angle)
 
@@ -514,12 +529,13 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
             return None
         extra = profile.extra or {}
         key = extra.get("key", DEFAULT_SECRET)
+        mode = extra.get("mode", "enhanced")   # 'fast' 或 'enhanced'
         cand = [c for c in (extra.get("cand_contents") or []) if c]
         if not cand and extra.get("content"):
             cand = [extra["content"]]
 
         img = _read_image(path)
-        dec = _decode_core(img, key)
+        dec = _decode_core(img, key, mode=mode)
         if dec is None:
             return None
 
