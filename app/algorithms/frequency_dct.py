@@ -43,7 +43,7 @@ N_PILOT = 224             # 导频块数（负责同步，越多同步 Z 越高�
 N_DATA = N - N_PILOT      # 数据块 32
 MAGIC_N = 16              # magic 校验位（密钥绑定，负责选相与防伪）
 CONTENT_N = N_DATA - MAGIC_N   # 内容指纹 16bit
-SYNC_Z_TH = 6.2           # 同步命中阈值（实测有水印 min Z=6.98 / 无水印 max Z=5.49）
+SYNC_Z_TH = 5.5           # 同步命中阈值（实测有水印 min Z=5.89 / 无水印 max Z=5.49，取中间）
 MAGIC_ERR_TH = 3          # magic 允许位错（实测真实水印 max=1）
 # 检测尺度搜索范围（参考坐标系块数）：覆盖竖图(高约128块)与横图
 NB_MAX_H, NB_MAX_W = 130, 132
@@ -159,6 +159,31 @@ def render_text_wm(text):
     tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
     img = Image.new("L", (tw + 12, th + 8), 255)
     ImageDraw.Draw(img).text((6 - bbox[0], 4 - bbox[1]), text, fill=0, font=font)
+    return (np.array(img) < 128).astype(np.uint8)
+
+
+def render_text_wm_lines(lines, font_size=18):
+    """把多行文本渲染成二值图（1=文字, 0=底），用于频域预览同时显示内容+ID。"""
+    lines = [l for l in (lines or []) if l]
+    if not lines:
+        lines = ["HiddenWatermark"]
+    font = _pick_font(font_size)
+    tmp = ImageDraw.Draw(Image.new("L", (8, 8)))
+    max_w, total_h = 0, 0
+    bboxes = []
+    for line in lines:
+        bbox = tmp.textbbox((0, 0), line, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        max_w = max(max_w, tw)
+        total_h += th + 4
+        bboxes.append(bbox)
+    img = Image.new("L", (max_w + 16, total_h + 8), 255)
+    draw = ImageDraw.Draw(img)
+    y = 4
+    for line, bbox in zip(lines, bboxes):
+        th = bbox[3] - bbox[1]
+        draw.text((8 - bbox[0], y - bbox[1]), line, fill=0, font=font)
+        y += th + 4
     return (np.array(img) < 128).astype(np.uint8)
 
 
@@ -434,8 +459,9 @@ class FrequencyDctWatermark(WatermarkAlgorithm):
 
         fp = _bits_to_fp(dec["content_bits"])
         matched, sim = _fp_match(fp, cand)
-        label = matched or f"ID:{fp:04X}"
-        wm_arr = (render_text_wm(label) * 255).astype(np.uint8)   # 0/255 灰度图供 GUI 预览
+        id_line = f"ID:{fp:04X}"
+        content_line = matched or "内容: 未在本机记录"
+        wm_arr = (render_text_wm_lines([content_line, id_line]) * 255).astype(np.uint8)  # 内容+ID两行
         return {"detected": True, "algorithm": "frequency_dct",
                 "wm": wm_arr, "wm_size": wm_arr.shape[::-1], "key": key,
                 "matched_content": matched, "similarity": sim,

@@ -1303,11 +1303,11 @@ class WatermarkApp:
             lines.append("频域水印：检测失败")
         elif f and f.get("detected"):
             mc = f.get('matched_content')
+            fp = f.get('fp', '?')
             if mc:
-                lines.append(f"频域水印：密钥={f.get('matched_key', '?')} | 内容={mc} | 匹配度={f.get('similarity', 0) * 100:.0f}%")
+                lines.append(f"频域水印：密钥={f.get('matched_key', '?')} | 内容={mc} | ID={fp} | 匹配度={f.get('similarity', 0) * 100:.0f}%")
             else:
-                # 盲提取到水印（密钥命中）但内容不在历史库：下方提取图可肉眼辨认
-                lines.append(f"频域水印：已检出（密钥={f.get('matched_key', '?')}），内容见下方提取图")
+                lines.append(f"频域水印：已检出（密钥={f.get('matched_key', '?')}）| ID={fp} | 内容未在本机记录")
         else:
             lines.append("频域水印：未命中")
         return lines
