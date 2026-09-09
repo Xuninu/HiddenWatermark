@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.3.3 (2026-09-09)
+
+### 重大 UI 修复：彻底解决底部"开始加水印"按钮被裁切问题
+
+**问题**：改了多版底部按钮仍被裁切，按钮上半部分超出窗口可见区域。
+
+**根因（通过实际运行 GUI 用 winfo_y/winfo_height 测量发现）**：
+- `main_pw`（主体面板）的 `reqh=807px`，且它**先 pack**，占据了 807px 基本空间
+- `toolbar`（工具栏）被压缩到只有 **9px**（reqh=25px）
+- 当窗口高度不足时，先 pack 的 `main_pw` 占据太多空间，后 pack 的 `toolbar` 和 `bottom_bar` 被压缩裁切
+- 之前只调 minsize 和窗口高度，没有解决 pack 顺序这个根本问题
+
+**修复**：改变 pack 顺序
+- 旧顺序：`main_pw`(expand=True) → `bottom_bar` → `toolbar`
+- 新顺序：`bottom_bar` → `toolbar` → `main_pw`(expand=True)
+- 底部固定区域先 pack 分配固定空间，`main_pw` 最后 pack 用 `expand=True` 占据剩余空间
+- 这样 `main_pw` 的大 reqh 只会压缩自身，不会压缩底部区域
+
+**验证（实际测量）**：
+| 控件 | 修改前 | 修改后 |
+|------|-------|-------|
+| toolbar 高度 | 9px（被压缩） | 25px（完整）✓ |
+| bottom_bar 高度 | 100px | 100px（完整）✓ |
+| 按钮位置 | 上半部分被裁切 | y=17, h=38, 完整 ✓ |
+| 状态栏位置 | 不可见 | y=65, h=35, 完整 ✓ |
+
+- 多种窗口高度（820/850/900/981/1000px）下底部区域均完整显示
+- GUI `--smoke` 自检通过
+
 ## v0.3.2 (2026-09-09)
 
 ### UI 修复

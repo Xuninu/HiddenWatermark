@@ -452,7 +452,7 @@ class WatermarkApp:
         # ===== 主体：外层水平 Panedwindow（左侧功能区 | 右侧预览区），分隔条可拖拽 =====
         style = ttk.Style()
         main_pw = tk.PanedWindow(self.root, orient="horizontal", sashwidth=6, sashrelief="flat", bg=BG, showhandle=False, borderwidth=0)
-        main_pw.pack(fill="both", expand=True, padx=12, pady=(8, 8))
+        # 注意：main_pw的pack移到最后（bottom_bar和toolbar之后），确保底部区域先分配空间不被压缩
 
         # ---- 左侧：垂直 Panedwindow（文件列表 | 动作 | 输出日志）----
         left_pw = tk.PanedWindow(main_pw, orient="vertical", sashwidth=6, sashrelief="flat", bg=BG, showhandle=False, borderwidth=0)
@@ -648,8 +648,11 @@ class WatermarkApp:
                                       font=UI_BOLD, bg=BG)
         self.run_btn.pack(side="bottom", pady=(8, 10))
 
-        # ===== 打包顺序：工具栏，最后主体 =====
+        # ===== 打包顺序：先底部固定区域，再工具栏，最后主体(expand占据剩余) =====
+        # 底部和工具栏先pack分配固定空间，main_pw最后pack用expand=True占据剩余空间
+        # 这样main_pw的大reqh不会压缩底部区域
         toolbar.pack(fill="x", padx=16, pady=(12, 0))
+        main_pw.pack(fill="both", expand=True, padx=12, pady=(8, 8))
         # 初始面板比例（延迟到窗口显示后设置 sash 位置）
         self.root.after_idle(lambda: self._init_sash(main_pw, left_pw, self.right_pw))
 
