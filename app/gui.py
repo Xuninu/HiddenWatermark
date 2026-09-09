@@ -131,6 +131,32 @@ def _save_known_contents(contents: set):
         pass
 
 
+def _clear_persistent_cache():
+    """启动时清除所有持久化缓存：密钥历史、内容历史库、壁纸缓存，避免以前的数据影响当前检测。"""
+    import os as _os
+    # 清除密钥历史
+    try:
+        kp = _keys_path()
+        if _os.path.exists(kp):
+            _os.remove(kp)
+    except Exception:
+        pass
+    # 清除内容历史库
+    try:
+        cp = _contents_path()
+        if _os.path.exists(cp):
+            _os.remove(cp)
+    except Exception:
+        pass
+    # 清除壁纸缓存
+    try:
+        wp = _os.path.join(tempfile.gettempdir(), "hw_wallpaper.png")
+        if _os.path.exists(wp):
+            _os.remove(wp)
+    except Exception:
+        pass
+
+
 
 
 def _profile_desc(p) -> str:
@@ -330,6 +356,8 @@ class WatermarkApp:
         self._resize_job = None
         self._freq_resize_job = None
         self._grid_resize_job = None
+        # 启动时清除持久化缓存（密钥历史、内容历史库、壁纸），避免以前的数据影响当前检测
+        _clear_persistent_cache()
         self._known_keys = _load_known_keys() or {DEFAULT_SECRET}
         self._known_contents = _load_known_contents()
 
