@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.5 (2026-09-09)
+
+### UI 修复
+- **修复检测模式默认仍显示增强模式的问题**：v0.3.4 中初始化时错误调用了 `_on_detect_mode_change()`（清除缓存重新检测），而非 `_update_mode_buttons()`（更新按钮视觉状态），导致按钮视觉状态未与默认值 fast 同步。修复为调用正确的 `_update_mode_buttons()` 方法
+- 同时修复 `_set_detect_mode` 方法中误将 `_on_detect_mode_change()` 替换为 `_update_mode_buttons()` 的问题，恢复为正确的调用顺序：先更新视觉状态，再清除缓存重新检测
+
+### 验证
+- GUI `--smoke` 自检通过
+
 ## v0.3.4 (2026-09-09)
 
 ### UI 修复
