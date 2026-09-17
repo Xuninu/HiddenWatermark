@@ -264,7 +264,7 @@ class RoundedButton(tk.Canvas):
         self._text = text
         self._command = command
         self._fill = fill
-        self._active_fill = active_fill or fill
+        self._active_fill = active_fill or self._darker(fill)
         self._fg = fg
         self._radius = radius
         self._font = font
