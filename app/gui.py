@@ -253,6 +253,19 @@ class RoundedCard(tk.Frame):
 class RoundedButton(tk.Canvas):
     """圆角按钮：Canvas 自绘圆角矩形 + 文字，支持 hover/点击，避免硬边突出卡片。"""
 
+    @staticmethod
+    def _darker(hex_color, factor=0.86):
+        """将十六进制颜色按 factor 变暗，用于 hover 效果。"""
+        try:
+            h = hex_color.lstrip("#")
+            if len(h) == 3:
+                h = "".join(c * 2 for c in h)
+            r = int(h[0:2], 16); g = int(h[2:4], 16); b = int(h[4:6], 16)
+            r = max(0, int(r * factor)); g = max(0, int(g * factor)); b = max(0, int(b * factor))
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:
+            return hex_color
+
     def __init__(self, parent, text, command, fill="#F1F5F9", fg="#475569",
                  active_fill=None, width=None, height=30, radius=8, font=UI,
                  bg=CARD, padx=14, **kw):
@@ -260,8 +273,7 @@ class RoundedButton(tk.Canvas):
             tw = sum(11 if ord(ch) > 127 else 6 for ch in text)
             width = tw + padx * 2
         super().__init__(parent, width=width, height=height, bg=bg,
-                         highlightthickness=0, **kw)
-        self._text = text
+                         highlightthickness=0, cursor="hand2", **kw)
         self._command = command
         self._fill = fill
         self._active_fill = active_fill or self._darker(fill)
